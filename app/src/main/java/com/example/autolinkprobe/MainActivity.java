@@ -20,6 +20,7 @@ import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
+import android.util.DisplayMetrics;
 
 import java.io.ByteArrayOutputStream;
 
@@ -32,6 +33,7 @@ import java.text.SimpleDateFormat;
 import java.util.Arrays;
 import java.util.Date;
 import java.util.Locale;
+import java.nio.charset.StandardCharsets;
 
 /**
  * Diagnostic AOA probe; only known handshake replies can be transmitted.
@@ -54,6 +56,8 @@ public final class MainActivity extends Activity {
     private volatile boolean versionReplySent;
     private volatile boolean encapsulatedSslSeen;
     private volatile boolean authReplySent;
+    private volatile boolean authCompleteSeen;
+    private volatile boolean discoveryRequestSent;
     private final ByteArrayOutputStream incomingFrames = new ByteArrayOutputStream();
     private TextView logView;
     private final StringBuilder log = new StringBuilder();
@@ -92,6 +96,7 @@ public final class MainActivity extends Activity {
         addButton(root, "Автотест: пройти 2 известных шага", this::enableAutoTest);
         addButton(root, "3. Ответить VERSION_RESPONSE 1.11 (один раз)", this::respondVersion);
         addButton(root, "4. Ответить AUTH_RESPONSE (status=0)", this::respondAuth);
+        addButton(root, "5. Запросить сервисы магнитолы (SERVICE_DISCOVERY)", this::sendServiceDiscovery);
         addButton(root, "Остановить чтение", this::stopReading);
         addButton(root, "Сохранить лог в файл", this::exportLog);
         addButton(root, "Скопировать лог", () -> {
@@ -211,6 +216,8 @@ public final class MainActivity extends Activity {
             versionReplySent = false;
             encapsulatedSslSeen = false;
             authReplySent = false;
+            authCompleteSeen = false;
+            discoveryRequestSent = false;
             incomingFrames.reset();
             append("Порт открыт, сессия " + thisSession + ". Читаем RX; передача только по известным запросам.");
             mainHandler.postDelayed(() -> {
@@ -321,8 +328,14 @@ public final class MainActivity extends Activity {
                     append("Сообщение ID 3 пришло до ответа версии; AUTH_RESPONSE заблокирован");
                 }
             } else if (channel == 0 && msgId == 4) {
-                append("Кадр ID=4 (вероятно AUTH_COMPLETE): " + hex(frame, frame.length)
-                        + ". Стоковый AutoLink после него отправляет SERVICE_DISCOVERY_REQUEST (ID 5). Пока не отправляем.");
+                if (authReplySent && Arrays.equals(frame, AUTH_RESPONSE)) {
+                    authCompleteSeen = true;
+                    append("AUTH_COMPLETE (ID 4, status=0) получен. Штатный AutoLink теперь отправляет SERVICE_DISCOVERY_REQUEST; можно нажать кнопку 5.");
+                } else {
+                    append("Неожиданный ID 4: " + hex(frame, frame.length) + ". Кнопка 5 заблокирована.");
+                }
+            } else if (channel == 0 && msgId == 6) {
+                append("SERVICE_DISCOVERY_RESPONSE получен (ID 6)! Скопируй полный RX и пришли мне, другие сообщения пока не отправляем.");
             } else {
                 append("Разобран кадр: канал=" + channel + ", флаги=" +
                         String.format(Locale.US, "0x%02X", frame[1] & 0xff)
