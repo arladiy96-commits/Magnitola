@@ -673,8 +673,13 @@ public final class MainActivity extends Activity {
         setIntent(intent);
         append("Новый intent: " + intent.getAction());
         if (UsbManager.ACTION_USB_ACCESSORY_ATTACHED.equals(intent.getAction()) && listening) {
-            append("Новый USB ATTACHED — закрываю старую сессию.");
-            stopReading();
+            // Android can deliver a second ATTACHED launch intent for the same
+            // accessory. Never discard an active streaming session solely
+            // because the activity received another launch intent: the device
+            // did not necessarily detach or physically re-enumerate.
+            append("Повторный USB ATTACHED при активном RX: сохраняю открытую сессию "
+                    + sessionId + ", не закрываю порт.");
+            return;
         }
         scan();
         if (selected != null && UsbManager.ACTION_USB_ACCESSORY_ATTACHED.equals(intent.getAction())) {
