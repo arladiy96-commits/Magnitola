@@ -21,6 +21,7 @@ import android.os.ParcelFileDescriptor;
 import android.os.Handler;
 import android.os.Looper;
 import android.widget.Button;
+import android.view.ViewGroup;
 import android.widget.EditText;
 import android.text.InputType;
 import android.widget.LinearLayout;
