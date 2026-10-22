@@ -40,6 +40,8 @@ import org.maplibre.android.geometry.LatLng;
 import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.Locale;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 
 /**
  * Genuine vector-map navigator running exclusively on the encoder-backed
@@ -53,6 +55,12 @@ final class NavigatorPresentation extends Presentation {
     private static final int BLUE = 0xFF1676F8;
     private static final String STYLE_URL = "https://tiles.openfreemap.org/styles/liberty";
     private static final String ROUTE_SOURCE = "gaz-route-source";
+    private final Consumer<String> reportToPhone;
+    private final AtomicInteger tilesLoaded = new AtomicInteger();
+    private final AtomicInteger tileErrors = new AtomicInteger();
+    private final AtomicInteger glFrames = new AtomicInteger();
+    private String mapFailure = "";
+    private long lastHealthReport;
     private final Handler ui = new Handler(Looper.getMainLooper());
     private MapView mapView;
     private MapLibreMap map;
@@ -83,8 +91,22 @@ final class NavigatorPresentation extends Presentation {
         }
     };
 
-    NavigatorPresentation(Context context, Display display) {
+    NavigatorPresentation(Context context, Display display, Consumer<String> reportToPhone) {
         super(context, display);
+        this.reportToPhone = reportToPhone;
+    }
+
+    private void reportMapHealth(String reason) {
+        if (mapView == null) return;
+        long now = SystemClock.elapsedRealtime();
+        if (now - lastHealthReport < 1800) return;
+        lastHealthReport = now;
+        reportToPhone.accept("КАРТА МАГНИТОЛА: " + reason
+                + " • стиль=" + (styleReady ? "OK" : "НЕТ")
+                + " • тайлы=" + tilesLoaded.get()
+                + " • ошибки=" + tileErrors.get()
+                + " • кадры GL=" + glFrames.get()
+                + (mapFailure.isEmpty() ? "" : " • " + mapFailure));
     }
 
     private int dp(float value) {
@@ -122,8 +144,8 @@ final class NavigatorPresentation extends Presentation {
                 .zoomGesturesEnabled(false).scrollGesturesEnabled(false)
                 .rotateGesturesEnabled(false).tiltGesturesEnabled(false);
         mapView = new MapView(getContext(), options);
-        mapView.onCreate(null);
         root.addView(mapView, new FrameLayout.LayoutParams(-1, -1));
+        mapView.onCreate(null);
 
         // The arrow stays on the GPS center. Route and vector roads rotate
         // together based on course over ground (while moving).
@@ -214,16 +236,47 @@ final class NavigatorPresentation extends Presentation {
         root.addView(mapAttribution, attrParams);
 
         setContentView(root);
+        mapView.addOnDidFailLoadingMapListener(error -> {
+            mapFailure = error;
+            ui.post(() -> {
+                if (mapLoading != null) {
+                    mapLoading.setText("Ошибка карты: " + error);
+                    mapLoading.setVisibility(View.VISIBLE);
+                }
+                reportMapHealth("ошибка MapLibre");
+            });
+        });
+        mapView.addOnTileActionListener((op, x, y, z, wrap, overscaledZ, sourceId) -> {
+            String kind = String.valueOf(op);
+            if (kind.contains("LoadFromNetwork") || kind.contains("LoadFromCache")
+                    || kind.contains("LoadFromDatabase")) {
+                if (tilesLoaded.incrementAndGet() == 1) ui.post(() -> {
+                    if (mapLoading != null && styleReady && mapFailure.isEmpty())
+                        mapLoading.setVisibility(View.GONE);
+                    reportMapHealth("дороги скачиваются");
+                });
+            } else if (kind.contains("Error")) {
+                if (tileErrors.incrementAndGet() == 1)
+                    ui.post(() -> reportMapHealth("ошибка тайлов"));
+            }
+        });
+        mapView.addOnDidFinishRenderingFrameListener((fully, encodingTime, renderingTime) -> {
+            if (glFrames.incrementAndGet() == 1)
+                ui.post(() -> reportMapHealth("GL рендер начал работу"));
+        });
         mapView.onStart();
         mapView.onResume();
         mapView.getMapAsync(readyMap -> {
+            reportMapHealth("MapLibre готов");
             if (mapView == null) return;
             map = readyMap;
             readyMap.getUiSettings().setAllGesturesEnabled(false);
             readyMap.setStyle(STYLE_URL, style -> {
                 if (mapView == null) return;
                 styleReady = true;
-                mapLoading.setVisibility(View.GONE);
+                if (tilesLoaded.get() > 0) mapLoading.setVisibility(View.GONE);
+                else mapLoading.setText("Стиль загружен. Жду тайлы дорог…");
+                reportMapHealth("стиль загружен");
                 if (activeRoute != null) installRoute(style, activeRoute);
                 Location fix = NavigationLocationService.latestLocation();
                 if (fix != null) onGps(fix);
@@ -233,6 +286,18 @@ final class NavigatorPresentation extends Presentation {
         });
         NavigationLocationService.subscribe(gpsObserver);
         ui.postDelayed(watchdog, 3500);
+        ui.postDelayed(() -> {
+            if (mapView == null) return;
+            if (!styleReady) {
+                mapLoading.setText("Стиль карты не загрузился. Проверь интернет.");
+                reportMapHealth("нет стиля через 15 сек");
+            } else if (tilesLoaded.get() == 0) {
+                mapLoading.setText("Тайлы дорог не пришли. Проверь карту на телефоне.");
+                reportMapHealth("нет тайлов через 15 сек");
+            } else {
+                reportMapHealth("карта загрузила тайлы");
+            }
+        }, 15000);
     }
 
     private void etaValuePlaceholder(LinearLayout etaBox) {
