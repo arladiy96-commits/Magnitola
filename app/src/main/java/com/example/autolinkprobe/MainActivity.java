@@ -16,6 +16,8 @@ import android.os.ParcelFileDescriptor;
 import android.os.Handler;
 import android.os.Looper;
 import android.widget.Button;
+import android.widget.EditText;
+import android.text.InputType;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
@@ -59,6 +61,9 @@ public final class MainActivity extends Activity {
     private volatile boolean discoveryRequestSent;
     private final ByteArrayOutputStream incomingFrames = new ByteArrayOutputStream();
     private TextView logView;
+    private EditText scriptEditor;
+    private final ProtocolScript script = new ProtocolScript();
+    private volatile boolean scriptEnabled;
     private final StringBuilder log = new StringBuilder();
 
     private final BroadcastReceiver receiver = new BroadcastReceiver() {
@@ -89,7 +94,23 @@ public final class MainActivity extends Activity {
         scroll.addView(root);
 
         root.addView(label("AutoLink USB Probe"));
-        root.addView(label("Только чтение USB. Не изменяет прошивку магнитолы и ничего ей не отправляет."));
+        root.addView(label("USB-диагностика. Пакеты отправляются только после явного запуска сценария или нажатия кнопок 3/4."));
+        root.addView(label("Сценарий обмена (можно менять БЕЗ переустановки APK):"));
+        scriptEditor = new EditText(this);
+        scriptEditor.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        scriptEditor.setMinLines(5);
+        scriptEditor.setMaxLines(9);
+        scriptEditor.setTextSize(12);
+        scriptEditor.setHorizontallyScrolling(false);
+        scriptEditor.setText(getPreferences(MODE_PRIVATE).getString("usb_script", ProtocolScript.DEFAULT_SCRIPT));
+        root.addView(scriptEditor);
+        addButton(root, "Запустить сценарий (без пересборки APK)", this::runScript);
+        addButton(root, "Остановить сценарий", this::stopScript);
+        addButton(root, "Сбросить сценарий до проверенного", () -> {
+            scriptEditor.setText(ProtocolScript.DEFAULT_SCRIPT);
+            saveScript();
+            append("Редактор восстановлен до известного сценария.");
+        });
         addButton(root, "1. Найти USB-аксессуар", this::scan);
         addButton(root, "2. Слушать USB (не больше 64 КБ)", this::start);
         addButton(root, "Автотест: пройти 2 известных шага", this::enableAutoTest);
@@ -218,6 +239,7 @@ public final class MainActivity extends Activity {
             authCompleteSeen = false;
             discoveryRequestSent = false;
             incomingFrames.reset();
+            if (scriptEnabled) script.onReconnect();
             append("Порт открыт, сессия " + thisSession + ". Читаем RX; передача только по известным запросам.");
             mainHandler.postDelayed(() -> {
                 if (listening && sessionId == thisSession && totalRead == 0) {
@@ -312,6 +334,14 @@ public final class MainActivity extends Activity {
             byte[] frame = Arrays.copyOfRange(data, offset, offset + fullLength);
             int channel = frame[0] & 0xff;
             int msgId = ((frame[4] & 0xff) << 8) | (frame[5] & 0xff);
+            if (scriptEnabled && script.isArmed()) {
+                script.onFrame(frame, new ProtocolScript.Transport() {
+                    @Override public void log(String line) { append(line); }
+                    @Override public void send(byte[] outgoing) throws IOException {
+                        sendScriptPacket(outgoing);
+                    }
+                });
+            }
             if (Arrays.equals(frame, VERSION_REQUEST)) {
                 versionRequestSeen = true;
                 append("Кадр VERSION_REQUEST 1.10 подтверждён." +
@@ -350,7 +380,53 @@ public final class MainActivity extends Activity {
         }
     }
 
+    private void saveScript() {
+        getPreferences(MODE_PRIVATE).edit()
+                .putString("usb_script", scriptEditor.getText().toString()).apply();
+    }
+
+    private void runScript() {
+        try {
+            String code = scriptEditor.getText().toString();
+            script.loadAndArm(code);
+            saveScript();
+            scriptEnabled = true;
+            autoHandshake = false; // Prevent duplicate automatic VERSION/AUTH replies.
+            append("Сценарий загружен: " + script.stepCount() + " шагов. " +
+                    "Ждём USB-подключение и точные входящие кадры. Неизвестные кадры не вызывают TX.");
+            if (!listening) {
+                start();
+            } else if (totalRead != 0) {
+                append("ВНИМАНИЕ: обмен уже начался. Для сценария с первого пакета " +
+                        "вытащи USB-кабель на 5 секунд и подключи заново.");
+            }
+        } catch (IllegalArgumentException ex) {
+            append("Ошибка сценария: " + ex.getMessage());
+        }
+    }
+
+    private void stopScript() {
+        script.stop();
+        scriptEnabled = false;
+        append("Сценарий остановлен: никакие дальнейшие пакеты по нему не отправятся.");
+    }
+
+    private void sendScriptPacket(byte[] packet) throws IOException {
+        synchronized (this) {
+            if (!listening || descriptor == null)
+                throw new IOException("Порт отключён");
+            // Runs in the RX thread; keeps each scripted send in strict RX order.
+            FileOutputStream output = new FileOutputStream(descriptor.getFileDescriptor());
+            output.write(packet);
+            output.flush();
+            int id = ((packet[4] & 0xff) << 8) | (packet[5] & 0xff);
+            if (id == 2) versionReplySent = true;
+            if (id == 4) authReplySent = true;
+        }
+    }
+
     private void enableAutoTest() {
+        stopScript();
         autoHandshake = true;
         append("Автотест разрешён: отправляем максимум 1 VERSION_RESPONSE и 1 AUTH_RESPONSE, " +
                 "только после ТОЧНОГО совпадения входящих запросов. Неизвестным пакетам не отвечаем.");
@@ -474,6 +550,9 @@ public final class MainActivity extends Activity {
             append("AUTH_RESPONSE заблокирован: не получен точный кадр ENCAPSULATED_SSL 00 00.");
             return;
         }
+        if (scriptEnabled && script.isArmed()) {
+            append("Ручной ответ недоступен пока выполняется сценарий."); return;
+        }
         if (authReplySent) {
             append("AUTH_RESPONSE уже отправлялся в этой сессии.");
             return;
@@ -510,6 +589,9 @@ public final class MainActivity extends Activity {
         if (!versionRequestSeen) {
             append("Ответ заблокирован: точный VERSION_REQUEST v1.10 ещё не распознан.");
             return;
+        }
+        if (scriptEnabled && script.isArmed()) {
+            append("Ручной ответ недоступен пока выполняется сценарий."); return;
         }
         if (versionReplySent) {
             append("VERSION_RESPONSE уже отправлялся в этой сессии.");
