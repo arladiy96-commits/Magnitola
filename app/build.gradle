@@ -1,14 +1,32 @@
 plugins {
     id 'com.android.application'
 }
+
 android {
     namespace 'com.example.autolinkprobe'
     compileSdk 35
+
     defaultConfig {
         applicationId 'com.example.autolinkprobe'
-        minSdk 26
+        minSdk 24
         targetSdk 35
-        versionCode 5
-        versionName '0.5-premium-gps'
+        versionCode 6
+        versionName '0.6-dual-device'
+    }
+
+    flavorDimensions 'device'
+    productFlavors {
+        poco {
+            dimension 'device'
+            minSdk 26
+            resValue 'string', 'app_name', 'GAZ Спидометр'
+        }
+        tablet {
+            dimension 'device'
+            minSdk 24
+            applicationIdSuffix '.tablet'
+            versionNameSuffix '-android7'
+            resValue 'string', 'app_name', 'GAZ Спидометр (планшет)'
+        }
     }
 }
