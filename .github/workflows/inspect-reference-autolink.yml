@@ -1,0 +1,78 @@
+name: Inspect verified AutoLink 2.0.59 protocol
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/inspect-reference-autolink.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Fetch same-hash vendor APK (temporary runner only)
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 --max-time 90             -A 'Mozilla/5.0 (Android; Mobile)'             'https://d.apkpure.net/b/APK/com.link.autolink?version=latest'             --output /tmp/original-autolink.apk
+          echo "2c883dc835799fa11aa58964ccde9fd57bd1b6224bb155a21e90ce04fde1dbfb  /tmp/original-autolink.apk" | sha256sum -c
+          unzip -p /tmp/original-autolink.apk 'lib/arm64-v8a/libaljni.so' > /tmp/libaljni.so
+          test -s /tmp/libaljni.so
+      - name: Extract symbolic call-trace and opcode evidence only
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet capstone pyelftools
+          mkdir -p diagnostic
+          cat > /tmp/disasm.py <<'PY'
+          from elftools.elf.elffile import ELFFile
+          from capstone import Cs, CS_ARCH_ARM64, CS_MODE_ARM
+          import re
+          f = open('/tmp/libaljni.so', 'rb')
+          elf = ELFFile(f)
+          segs = [s for s in elf.iter_segments() if s['p_type']=='PT_LOAD']
+          symbols={}
+          for symsect in (elf.get_section_by_name('.dynsym'), elf.get_section_by_name('.symtab')):
+              if symsect is None: continue
+              for sym in symsect.iter_symbols():
+                  if sym.name and sym['st_value']:
+                      symbols[sym.name] = (sym['st_value'], sym['st_size'])
+          keys=('VideoSource', 'MessageRouter', 'ChannelManager', 'sendPingResponse', 'routeMessage', 'handleChannel')
+          selected=[(name,a,n) for name,(a,n) in symbols.items() if any(k in name for k in keys)]
+          md=Cs(CS_ARCH_ARM64,CS_MODE_ARM)
+          output=[]
+          def log(s): output.append(str(s))
+          log('AutoLink 2.0.59 (verified SHA-256) libaljni.so protocol symbols and ARM64 disassembly')
+          log('ELF arch='+elf['e_machine'])
+          log('Symbol count '+str(len(symbols))+' selected '+str(len(selected)))
+          selected.sort(key=lambda x:x[1])
+          for name,a,size in selected:
+              log(f'SYMBOL 0x{a:08x} size={size} {name}')
+          log('\nDISASSEMBLY SELECTED:')
+          subset=[(name,a,size) for name,a,size in selected if any(k in name.lower() for k in
+                    ('videosource', 'sendpingresponse', 'queueoutgoing', 'marshallproto', 'channelmanager'))]
+          # Bound length to avoid unnecessary storage of disassembly from the vendor library.
+          for name,a,size in subset[:60]:
+              log(f'\n--- {name}, vaddr=0x{a:x} size={size} ---')
+              seg=next((p for p in segs if int(p['p_vaddr'])<=a<int(p['p_vaddr'])+int(p['p_filesz'])),None)
+              if seg is None: continue
+              start=int(seg['p_offset'])+a-int(seg['p_vaddr'])
+              f.seek(start)
+              raw=f.read(min(int(size) if size else 400,1200))
+              for i,ins in enumerate(md.disasm(raw,a)):
+                  if i>=260:break
+                  log(f'0x{ins.address:x}: {ins.mnemonic} {ins.op_str}')
+          open('diagnostic/symbolic-protocol-report.txt','w').write('\n'.join(output))
+          print('Found',len(selected),'relevant symbols, wrote',len(output),'lines.')
+          PY
+          python /tmp/disasm.py
+      - name: Upload text-only diagnostic
+        uses: actions/upload-artifact@v4
+        with:
+          name: reference-autolink-symbolic-protocol
+          path: diagnostic/symbolic-protocol-report.txt
+          retention-days: 2
