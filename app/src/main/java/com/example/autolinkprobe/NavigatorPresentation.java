@@ -35,7 +35,7 @@ import org.maplibre.android.maps.Style;
 import org.maplibre.android.style.layers.LineLayer;
 import org.maplibre.android.style.sources.GeoJsonSource;
 import org.maplibre.android.style.layers.PropertyFactory;
-import org.osmdroid.util.GeoPoint;
+import org.maplibre.android.geometry.LatLng;
 
 import java.text.SimpleDateFormat;
 import java.util.Date;
@@ -314,7 +314,7 @@ final class NavigatorPresentation extends Presentation {
             if (style.getLayer("gaz-route-outline") != null) style.removeLayer("gaz-route-outline");
             if (style.getSource(ROUTE_SOURCE) != null) style.removeSource(ROUTE_SOURCE);
             JSONArray points = new JSONArray();
-            for (GeoPoint p : route.geometry) {
+            for (LatLng p : route.geometry) {
                 points.put(new JSONArray().put(p.getLongitude()).put(p.getLatitude()));
             }
             JSONObject geo = new JSONObject();
@@ -409,7 +409,7 @@ final class NavigatorPresentation extends Presentation {
         return "↑";
     }
 
-    private static double approxMeters(double lat, double lon, GeoPoint road) {
+    private static double approxMeters(double lat, double lon, LatLng road) {
         double y = (lat - road.getLatitude()) * 111132.;
         double x = (lon - road.getLongitude()) * 111320.
                 * Math.cos(Math.toRadians(lat));
