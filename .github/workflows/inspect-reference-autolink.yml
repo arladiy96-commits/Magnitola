@@ -88,6 +88,9 @@ jobs:
               echo '=== Java video protocol source file matches ==='
               find /tmp/jadx-src/sources/com/car/autolink -iname '*VideoSource*' \
                 -o -iname '*VideoService*' 2>/dev/null | head -20
+              echo '=== VideoSource declarations (method signatures) ==='
+              grep -n -E 'native|send|class|interface' \
+                /tmp/jadx-src/sources/com/car/autolink/module/protocal/eightthree/project/VideoSource.java | head -130 || true
               echo '=== Context of sendStart call ==='
               grep -R -n -B 6 -A 6 -E '\\.sendStart\\(' \
                 /tmp/jadx-src/sources/com/car/autolink 2>/dev/null | head -180 || true
