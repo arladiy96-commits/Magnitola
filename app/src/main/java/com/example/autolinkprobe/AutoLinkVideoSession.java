@@ -23,10 +23,24 @@ final class AutoLinkVideoSession {
     private volatile int sent = 0, acked = 0;
     private int selectedConfig = 2;
     private boolean setupAccepted, focusGranted;
+    // HU marks its post-auth frames with bit3 even though the captured payload parses
+    // as clear protobuf. Mirroring that *flag* is an experiment, not actual TLS.
+    private volatile boolean mirrorPeerFlag = true;
     private MediaCodec codec;
     private Surface surface;
 
     AutoLinkVideoSession(Sink sink) { this.sink = sink; }
+
+    synchronized void setMirrorPeerFlag(boolean enabled) { mirrorPeerFlag = enabled; }
+    boolean isMirrorPeerFlag() { return mirrorPeerFlag; }
+    private int specificFlags() { return mirrorPeerFlag ? 0x0B : 0x03; }
+
+    synchronized String state() {
+        if (streaming) return "ВИДЕО ИДЁТ: frames=" + sent + " ack=" + acked;
+        if (channel < 0) return "канал не открыт";
+        if (setupAccepted) return "Setup принят, ожидание фокуса (ch=" + channel + ")";
+        return "ожидание SetupResponse (ch=" + channel + ")";
+    }
 
     synchronized void open(int id) {
         if (channel > 0 || id < 1 || id > 255) return;
@@ -46,16 +60,19 @@ final class AutoLinkVideoSession {
                 int status = field(data, 1, -1);
                 sink.log("VIDEO: OPEN_RESPONSE status=" + status);
                 if (status != 0) { stop(); return; }
-                message(ch, 0x03, 0x8000, new byte[]{8, 3}); // H.264 Baseline codec enum=3
-                sink.log("VIDEO: H264 SETUP отправлен");
+                message(ch, specificFlags(), 0x8000, new byte[]{8, 3}); // H.264 Baseline
+                sink.log("VIDEO: H264 SETUP отправлен с flag=0x"
+                        + Integer.toHexString(specificFlags()) + "; жду ID 0x8003");
             } else if (id == 0x8003) {
                 int status = field(data, 1, -1), credit = field(data, 2, 1);
-                selectedConfig = Math.min(127, Math.max(0, field(data, 3, 2)));
+                selectedConfig = Math.min(127, Math.max(0, field(data, 3, 0)));
                 sink.log("VIDEO: SETUP_RESPONSE status=" + status + " credit=" + credit + " config=" + selectedConfig);
                 if (status != 2) { stop(); return; }
                 setupAccepted = true;
                 maxPending = Math.max(1, Math.min(10, credit));
-                message(ch, 0x03, 0x8007, new byte[]{8, 1}); // VIDEO_FOCUS_REQUEST
+                // VideoFocusRequest: field2=PROJECTED(1), field3=USER_SELECTION(4).
+                // There is no protobuf field1 in the actual schema.
+                message(ch, specificFlags(), 0x8007, new byte[]{16, 1, 24, 4});
                 sink.log("VIDEO: запросил видеорежим, жду VIDEO_FOCUS_INDICATION");
             } else if (id == 0x8008) {
                 int focus = field(data, 1, 0);
@@ -63,7 +80,7 @@ final class AutoLinkVideoSession {
                 if (focus != 1) { if (streaming) stop(); return; }
                 if (setupAccepted && !streaming) {
                     focusGranted = true;
-                    message(ch, 0x03, 0x8001, new byte[]{8, 1, 16, (byte) selectedConfig});
+                    message(ch, specificFlags(), 0x8001, new byte[]{8, 1, 16, (byte) selectedConfig});
                     sink.log("VIDEO: START отправлен, запускаю тестовую картинку");
                     startCodec();
                 }
@@ -148,6 +165,11 @@ final class AutoLinkVideoSession {
         data[0] = (byte) (id >>> 8); data[1] = (byte) id;
         System.arraycopy(payload, 0, data, 2, payload.length);
         sendFrames(ch, flags, data);
+        StringBuilder tx = new StringBuilder();
+        for (byte b : data) tx.append(String.format(java.util.Locale.US, "%02X ", b & 255));
+        sink.log(String.format(java.util.Locale.US,
+                "VIDEO TX: ch=%d flags=0x%02X id=0x%04X payload=[%s]",
+                ch, flags, id, tx.toString().trim()));
     }
     private void sendFrames(int ch, int flags, byte[] data) throws IOException {
         final int chunkMax = 16384;
@@ -266,7 +288,7 @@ final class AutoLinkVideoSession {
         if (!streaming || h264.length == 0) return;
         byte[] data = new byte[h264.length + 2]; data[1] = 1;
         System.arraycopy(h264, 0, data, 2, h264.length);
-        sendFrames(channel, 0x03, data);
+        sendFrames(channel, specificFlags(), data);
         sink.log("VIDEO: SPS/PPS отправлены " + h264.length + " байт");
     }
     private synchronized void sendMedia(byte[] h264, long pts) throws IOException {
@@ -274,7 +296,7 @@ final class AutoLinkVideoSession {
         byte[] data = new byte[h264.length + 10];
         for (int i = 0; i < 8; i++) data[2 + i] = (byte) (pts >>> (56 - i * 8));
         System.arraycopy(h264, 0, data, 10, h264.length);
-        sendFrames(channel, 0x03, data); pending++; sent++;
+        sendFrames(channel, specificFlags(), data); pending++; sent++;
         if (sent % 30 == 1) sink.log("VIDEO: H264 кадр=" + sent + " bytes=" + h264.length + " pts=" + pts);
     }
     private void error(Exception e) { sink.log("VIDEO: ошибка USB/протокола: " + e); stop(); }
