@@ -22,7 +22,11 @@ final class AutoLinkVideoSession {
     private volatile int channel = -1, pending = 0, maxPending = 1;
     private volatile int sent = 0, acked = 0;
     private int selectedConfig = 2;
-    private boolean setupAccepted, focusGranted;
+    private boolean setupAccepted, focusGranted, startRequested;
+    private boolean opened;
+    private int lastAckValue = 0;
+    private int configTransport = -1;
+
     // HU marks its post-auth frames with bit3 even though the captured payload parses
     // as clear protobuf. Mirroring that *flag* is an experiment, not actual TLS.
     private volatile boolean mirrorPeerFlag = true;
@@ -38,14 +42,17 @@ final class AutoLinkVideoSession {
     synchronized String state() {
         if (streaming) return "ВИДЕО ИДЁТ: frames=" + sent + " ack=" + acked;
         if (channel < 0) return "канал не открыт";
-        if (setupAccepted) return "Setup принят, ожидание фокуса (ch=" + channel + ")";
-        return "ожидание SetupResponse (ch=" + channel + ")";
+        if (startRequested) return "Start отправлен, жду StartResponse(ID7) ch=" + channel;
+        if (setupAccepted) return "Config получен, ch=" + channel;
+        if (opened) return "Setup(ID2) отправлен, жду Config(ID5), ch=" + channel;
+        return "ожидание CHANNEL_OPEN_RESPONSE(ID8), ch=" + channel;
     }
 
     synchronized void open(int id) {
         if (channel > 0 || id < 1 || id > 255) return;
-        channel = id; selectedConfig = 2; pending = sent = acked = 0;
-        setupAccepted = focusGranted = false;
+        channel = id; selectedConfig = 0; pending = sent = acked = lastAckValue = 0;
+        setupAccepted = focusGranted = startRequested = opened = false;
+        configTransport = -1;
         try {
             // Message 7 is CONTROL, but the channel is the TARGET wire channel.
             message(id, 0x07, 7, new byte[]{8, 0, 16, (byte) id});
@@ -53,46 +60,124 @@ final class AutoLinkVideoSession {
         } catch (IOException e) { error(e); }
     }
 
+    // Verified against original AutoLink 2.0.59 ARM64 libaljni.so:
+    // MediaSourceBase sends Setup=2, Start=3, Stop=4, codec config=1, media=0.
+    // Native MediaSourceBase::routeMessage receives Config=5, ACK=6,
+    // StartResponse=7, StopResponse=8, and control failure=0x00FF.
+    // VideoSource::routeMessage additionally receives FocusNotif=0x1001.
     synchronized void onRx(int ch, int id, byte[] data) {
         if (ch != channel || ch <= 0) return;
         try {
-            if (id == 8 && !setupAccepted) {
+            if (id == 8 && !opened) {
                 int status = field(data, 1, -1);
-                sink.log("VIDEO: OPEN_RESPONSE status=" + status);
+                sink.log("VIDEO: CHANNEL_OPEN_RESPONSE ID8 status=" + status);
                 if (status != 0) { stop(); return; }
-                message(ch, specificFlags(), 0x8000, new byte[]{8, 3}); // H.264 Baseline
-                sink.log("VIDEO: H264 SETUP отправлен с flag=0x"
-                        + Integer.toHexString(specificFlags()) + "; жду ID 0x8003");
-            } else if (id == 0x8003) {
-                int status = field(data, 1, -1), credit = field(data, 2, 1);
-                selectedConfig = Math.min(127, Math.max(0, field(data, 3, 0)));
-                sink.log("VIDEO: SETUP_RESPONSE status=" + status + " credit=" + credit + " config=" + selectedConfig);
-                if (status != 2) { stop(); return; }
+                opened = true;
+                // Actual proprietary AutoLink ID=2 (NOT Android Auto 0x8000).
+                message(ch, specificFlags(), 2, new byte[]{8, 3});
+                sink.log("VIDEO: native SETUP ID2 (H264 codec=3), жду Config ID5");
+            } else if (id == 5 && opened) {
+                int status = field(data, 1, -1);
+                int credit = field(data, 2, 1);
+                selectedConfig = Math.max(0, Math.min(127, field(data, 3, 0)));
+                configTransport = field(data, 4, -1);
+                sink.log("VIDEO: native CONFIG ID5 status=" + status + " credit=" + credit
+                        + " configIndex=" + selectedConfig + " transport=" + configTransport
+                        + " raw=" + asHex(data));
+                if (status != 2 || credit <= 0) {
+                    sink.log("VIDEO: Config отклонён/некорректен, Start не отправляю");
+                    stop();
+                    return;
+                }
                 setupAccepted = true;
                 maxPending = Math.max(1, Math.min(10, credit));
-                // VideoFocusRequest: field2=PROJECTED(1), field3=USER_SELECTION(4).
-                // There is no protobuf field1 in the actual schema.
-                message(ch, specificFlags(), 0x8007, new byte[]{16, 1, 24, 4});
-                sink.log("VIDEO: запросил видеорежим, жду VIDEO_FOCUS_INDICATION");
-            } else if (id == 0x8008) {
-                int focus = field(data, 1, 0);
-                sink.log("VIDEO: FOCUS=" + focus);
-                if (focus != 1) { if (streaming) stop(); return; }
-                if (setupAccepted && !streaming) {
-                    focusGranted = true;
-                    message(ch, specificFlags(), 0x8001, new byte[]{8, 1, 16, (byte) selectedConfig});
-                    sink.log("VIDEO: START отправлен, запускаю тестовую картинку");
-                    startCodec();
+                if (configTransport == 5) {
+                    sink.log("VIDEO: магнитола запросила RTP-транспорт (mode=5). "
+                            + "USB H264 без RTP не запускаю: нужен отдельный транспорт");
+                    return;
                 }
-            } else if (id == 0x8004) {
-                pending = Math.max(0, pending - Math.min(10, Math.max(1, field(data, 2, 1))));
+                startNative();
+            } else if (id == 7 && startRequested) {
+                int accepted = field(data, 1, -1);
+                sink.log("VIDEO: native START_RESPONSE ID7 accepted=" + accepted
+                        + " raw=" + asHex(data));
+                if (accepted != 1) {
+                    sink.log("VIDEO: отказ Start — кодировщик не запускаю");
+                    stop();
+                    return;
+                }
+                focusGranted = true;
+                startCodec();
+                // Focus notification is a separate proprietary video message:
+                // native VideoSource::sendVideoFocusRequest marshals ID 0x1000.
+                message(ch, specificFlags(), 0x1000, new byte[]{8, 1, 16, 1, 24, 0});
+                sink.log("VIDEO: запрошен native VideoFocus 0x1000 (PROJECTED)");
+            } else if (id == 0x1001) {
+                int focus = field(data, 1, -1);
+                sink.log("VIDEO: native FOCUS_NOTIFICATION 0x1001, mode=" + focus
+                        + " raw=" + asHex(data));
+                if (focus != 1 && streaming) {
+                    focusGranted = false;
+                    sink.log("VIDEO: другой экран владеет фокусом; остановка кадров");
+                } else if (focus == 1) {
+                    focusGranted = true;
+                }
+            } else if (id == 6) {
+                int n = field(data, 2, 0);
+                int delta = n > lastAckValue ? n - lastAckValue : 1;
+                lastAckValue = Math.max(lastAckValue, n);
+                pending = Math.max(0, pending - Math.min(maxPending, delta));
                 acked++;
-                if (acked % 30 == 1) sink.log("VIDEO: ACK=" + acked + ", pending=" + pending);
-            } else if (id == 0x8002) {
-                sink.log("VIDEO: STOP от магнитолы");
-                stop();
+                if (acked % 20 == 1) sink.log("VIDEO: native ACK ID6 count=" + n
+                        + " ack=" + acked + " pending=" + pending);
+            } else if (id == 0xff) {
+                sink.log("VIDEO: ERROR ID=0x00FF от магнитолы (без payload). "
+                        + "Текущий этап: " + state()
+                        + ". Это не ответ CONFIG; смотрим последний VIDEO TX.");
+            } else if (id == 0x1003) {
+                sink.log("VIDEO: native DISPLAY_CHANGE 0x1003 raw=" + asHex(data));
+            } else if (id == 8) {
+                sink.log("VIDEO: native STOP_RESPONSE ID8 raw=" + asHex(data));
+            } else {
+                sink.log("VIDEO: неизвестное native сообщение id=0x"
+                        + Integer.toHexString(id) + " payload=" + asHex(data));
             }
         } catch (IOException e) { error(e); }
+    }
+
+    private static String asHex(byte[] data) {
+        StringBuilder s = new StringBuilder();
+        for (byte b : data) s.append(String.format(java.util.Locale.US, "%02X ", b & 255));
+        return s.toString().trim();
+    }
+
+    /** MediaSourceBase::sendStart(session, index, width, height).
+     *  Protobuf Start: field1=configIndex, field2=session, field3=width,
+     *  field4=height. From verified JNI wrapper + native protobuf storage layout
+     *  and Java call site VideoSource.sendStart(session,index,width,height).
+     */
+    private void startNative() throws IOException {
+        if (startRequested || !setupAccepted) return;
+        ByteArrayOutputStream payload = new ByteArrayOutputStream();
+        putIntField(payload, 1, selectedConfig);
+        putIntField(payload, 2, 1);
+        putIntField(payload, 3, WIDTH);
+        putIntField(payload, 4, HEIGHT);
+        message(channel, specificFlags(), 3, payload.toByteArray());
+        startRequested = true;
+        sink.log("VIDEO: native START ID3; index=" + selectedConfig
+                + " session=1 resolution=" + WIDTH + "x" + HEIGHT
+                + " (жду START_RESPONSE ID7)");
+    }
+
+    private static void putIntField(ByteArrayOutputStream out, int field, int value) {
+        out.write((field << 3));
+        int v = value;
+        while ((v & ~127) != 0) {
+            out.write((v & 127) | 128);
+            v >>>= 7;
+        }
+        out.write(v);
     }
 
     /** Parse the actual video channel from HU ServiceDiscoveryResponse protobuf. */
@@ -172,7 +257,7 @@ final class AutoLinkVideoSession {
                 ch, flags, id, tx.toString().trim()));
     }
     private void sendFrames(int ch, int flags, byte[] data) throws IOException {
-        final int chunkMax = 16384;
+        final int chunkMax = 0x3f00; // matches native ChannelManager max fragment
         for (int pos = 0; pos < data.length;) {
             int n = Math.min(chunkMax, data.length - pos);
             int type = data.length <= chunkMax ? 3 : pos == 0 ? 1 : pos + n == data.length ? 2 : 0;
@@ -301,7 +386,8 @@ final class AutoLinkVideoSession {
     }
     private void error(Exception e) { sink.log("VIDEO: ошибка USB/протокола: " + e); stop(); }
     synchronized void stop() {
-        streaming = false; setupAccepted = focusGranted = false; channel = -1;
+        streaming = false; setupAccepted = focusGranted = startRequested = opened = false;
+        channel = -1;
         MediaCodec releasing = codec; codec = null;
         Surface oldSurface = surface; surface = null;
         if (releasing != null || oldSurface != null) new Thread(() -> {
