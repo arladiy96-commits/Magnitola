@@ -19,6 +19,8 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import java.io.ByteArrayOutputStream;
+
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
@@ -46,6 +48,9 @@ public final class MainActivity extends Activity {
     private int totalRead;
     private volatile boolean versionRequestSeen;
     private volatile boolean versionReplySent;
+    private volatile boolean encapsulatedSslSeen;
+    private volatile boolean authReplySent;
+    private final ByteArrayOutputStream incomingFrames = new ByteArrayOutputStream();
     private TextView logView;
     private final StringBuilder log = new StringBuilder();
 
@@ -81,6 +86,7 @@ public final class MainActivity extends Activity {
         addButton(root, "1. Найти USB-аксессуар", this::scan);
         addButton(root, "2. Слушать USB (не больше 64 КБ)", this::start);
         addButton(root, "3. Ответить VERSION_RESPONSE 1.11 (один раз)", this::respondVersion);
+        addButton(root, "4. Ответить AUTH_RESPONSE (status=0)", this::respondAuth);
         addButton(root, "Остановить чтение", this::stopReading);
         addButton(root, "Сохранить лог в файл", this::exportLog);
         addButton(root, "Скопировать лог", () -> {
@@ -191,27 +197,19 @@ public final class MainActivity extends Activity {
             totalRead = 0;
             versionRequestSeen = false;
             versionReplySent = false;
+            encapsulatedSslSeen = false;
+            authReplySent = false;
+            incomingFrames.reset();
             append("Порт открыт. Только входящий поток; никаких команд и handshake.");
             new Thread(() -> {
                 try (FileInputStream input = new FileInputStream(opened.getFileDescriptor())) {
                     byte[] buffer = new byte[1024];
-                    byte[] opening = new byte[10];
-                    int openingLength = 0;
+
                     int count;
                     while (listening && totalRead < MAX_READ
                             && (count = input.read(buffer)) != -1) {
                         totalRead += count;
-                        if (openingLength < opening.length) {
-                            int copy = Math.min(count, opening.length - openingLength);
-                            System.arraycopy(buffer, 0, opening, openingLength, copy);
-                            openingLength += copy;
-                            if (openingLength == opening.length && Arrays.equals(opening, VERSION_REQUEST)) {
-                                versionRequestSeen = true;
-                                append("VERSION_REQUEST распознан: Android Auto v1.10, канал 0. Можно нажать кнопку ответа 1.11.");
-                            } else if (openingLength == opening.length && !versionRequestSeen) {
-                                append("Первые 10 байт отличаются от известного запроса v1.10. Отвечать пока нельзя.");
-                            }
-                        }
+                        processIncomingFrames(buffer, count);
                         int hexLength = Math.min(count, 256);
                         append("RX " + count + " байт: " + hex(buffer, hexLength)
                                 + (count > hexLength ? " [остальное опущено]" : ""));
@@ -242,6 +240,102 @@ public final class MainActivity extends Activity {
             0x00, 0x03, 0x00, 0x08, 0x00, 0x02, 0x00, 0x01,
             0x00, 0x0B, 0x00, 0x00
     };
+
+
+    // Same message that followed VERSION_RESPONSE in the first successful field test.
+    // Original libaljni.so: Controller::routeMessage(msg 3) logs "EncapsulatedSsl"
+    // then calls sendAuthResponse(0). This is not a TLS ClientHello.
+    private static final byte[] ENCAPSULATED_SSL = new byte[] {
+            0x00, 0x03, 0x00, 0x04, 0x00, 0x03, 0x00, 0x00
+    };
+    // Controller::sendAuthResponse(0) -> protobuf AuthResponse { status: 0 }
+    // serialized as field 1 varint 0 => 08 00 with message ID 00 04.
+    private static final byte[] AUTH_RESPONSE = new byte[] {
+            0x00, 0x03, 0x00, 0x04, 0x00, 0x04, 0x08, 0x00
+    };
+
+    // USB reads may split or coalesce frames, so frame boundaries must
+    // be reconstructed instead of assuming that one read == one packet.
+    private void processIncomingFrames(byte[] bytes, int count) {
+        incomingFrames.write(bytes, 0, count);
+        byte[] data = incomingFrames.toByteArray();
+        int offset = 0;
+        while (data.length - offset >= 4) {
+            int len = ((data[offset + 2] & 0xff) << 8) | (data[offset + 3] & 0xff);
+            if (len < 2 || len > MAX_READ) {
+                append("Некорректная длина USB-кадра " + len + "; буфер сброшен");
+                incomingFrames.reset();
+                return;
+            }
+            int fullLength = len + 4;
+            if (data.length - offset < fullLength) break;
+            byte[] frame = Arrays.copyOfRange(data, offset, offset + fullLength);
+            int channel = frame[0] & 0xff;
+            int msgId = ((frame[4] & 0xff) << 8) | (frame[5] & 0xff);
+            if (Arrays.equals(frame, VERSION_REQUEST)) {
+                versionRequestSeen = true;
+                append("Кадр VERSION_REQUEST 1.10 подтверждён. Нажми кнопку 3.");
+            } else if (Arrays.equals(frame, ENCAPSULATED_SSL)) {
+                if (versionReplySent) {
+                    encapsulatedSslSeen = true;
+                    append("Кадр ENCAPSULATED_SSL (ID 3, 00 00) подтверждён. Оригинальный AutoLink отвечает AUTH_RESPONSE(status=0). Нажми кнопку 4.");
+                } else {
+                    append("Сообщение ID 3 пришло до ответа версии; AUTH_RESPONSE заблокирован");
+                }
+            } else if (channel == 0 && msgId == 4) {
+                append("Кадр ID=4 (вероятно AUTH_COMPLETE): " + hex(frame, frame.length)
+                        + ". Стоковый AutoLink после него отправляет SERVICE_DISCOVERY_REQUEST (ID 5). Пока не отправляем.");
+            } else {
+                append("Разобран кадр: канал=" + channel + ", флаги=" +
+                        String.format(Locale.US, "0x%02X", frame[1] & 0xff)
+                        + ", ID=" + msgId + ", payload=" + len + " байт");
+            }
+            offset += fullLength;
+        }
+        incomingFrames.reset();
+        incomingFrames.write(data, offset, data.length - offset);
+        if (incomingFrames.size() > MAX_READ) {
+            append("Превышен лимит накопленных данных, сброс");
+            incomingFrames.reset();
+        }
+    }
+
+    private void respondAuth() {
+        if (!listening || descriptor == null || !versionReplySent) {
+            append("AUTH_RESPONSE заблокирован: сначала подключись и ответь на VERSION_REQUEST.");
+            return;
+        }
+        if (!encapsulatedSslSeen) {
+            append("AUTH_RESPONSE заблокирован: не получен точный кадр ENCAPSULATED_SSL 00 00.");
+            return;
+        }
+        if (authReplySent) {
+            append("AUTH_RESPONSE уже отправлялся в этой сессии.");
+            return;
+        }
+        authReplySent = true;
+        final ParcelFileDescriptor opened = descriptor;
+        new Thread(() -> {
+            try {
+                synchronized (MainActivity.this) {
+                    if (!listening || descriptor != opened) {
+                        authReplySent = false;
+                        append("Соединение закрыто, AUTH_RESPONSE не отправлен");
+                        return;
+                    }
+                    // Stream shares the descriptor with the receive thread; do not close it.
+                    FileOutputStream output = new FileOutputStream(opened.getFileDescriptor());
+                    output.write(AUTH_RESPONSE);
+                    output.flush();
+                }
+                append("TX AUTH_RESPONSE status=0: " + hex(AUTH_RESPONSE, AUTH_RESPONSE.length));
+                append("Ждём ответ магнитолы. Дальнейшие сообщения автоматически не отправляются.");
+            } catch (Exception ex) {
+                authReplySent = false;
+                append("Ошибка AUTH_RESPONSE: " + ex.getMessage());
+            }
+        }, "aoa-auth-response").start();
+    }
 
     private void respondVersion() {
         if (!listening || descriptor == null) {
