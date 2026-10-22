@@ -33,7 +33,6 @@ import java.text.SimpleDateFormat;
 import java.util.Arrays;
 import java.util.Date;
 import java.util.Locale;
-import java.nio.charset.StandardCharsets;
 
 /**
  * Diagnostic AOA probe; only known handshake replies can be transmitted.
@@ -365,6 +364,105 @@ public final class MainActivity extends Activity {
             append("USB уже открыт, но первые байты не пришли. " +
                     "Вытащи кабель на 5 секунд и подключи заново — на входящем ATTACHED откроем порт автоматически.");
         }
+    }
+
+    // Reconstructed from AutoLink 2.0.59 libaljni.so:
+    // Controller::sendServiceDiscoveryRequest at 0x4ffa0 uses proto message ID 5.
+    // ServiceDiscoveryRequest::SerializeWithCachedSizes at 0x5d2b8 confirms:
+    // fields 1..4 = string, fields 5..6 = uint32. JNI nativeSetPhoneInfo
+    // confirms their order: manufacturer, model, Android version, device name,
+    // screen width, screen height. No identifiers/serials are transmitted.
+    private void sendServiceDiscovery() {
+        if (!listening || descriptor == null || !authCompleteSeen || !authReplySent) {
+            append("SERVICE_DISCOVERY заблокирован: сначала пройди VERSION / AUTH и получи подтверждённый AUTH_COMPLETE.");
+            return;
+        }
+        if (discoveryRequestSent) {
+            append("SERVICE_DISCOVERY_REQUEST уже отправлен в этой USB-сессии.");
+            return;
+        }
+
+        DisplayMetrics display = getResources().getDisplayMetrics();
+        final int width = Math.max(1, display.widthPixels);
+        final int height = Math.max(1, display.heightPixels);
+        final String manufacturer = Build.MANUFACTURER == null ? "Android" : Build.MANUFACTURER;
+        final String model = Build.MODEL == null ? "Phone" : Build.MODEL;
+        final String version = Build.VERSION.RELEASE == null ? "16" : Build.VERSION.RELEASE;
+        // Build.DEVICE is a generic product code, not a user's personal phone name.
+        final String name = Build.DEVICE == null ? "android" : Build.DEVICE;
+        final byte[] frame;
+        try {
+            ByteArrayOutputStream proto = new ByteArrayOutputStream();
+            putString(proto, 1, manufacturer);
+            putString(proto, 2, model);
+            putString(proto, 3, version);
+            putString(proto, 4, name);
+            putVarint(proto, 5 << 3);
+            putVarint(proto, width);
+            putVarint(proto, 6 << 3);
+            putVarint(proto, height);
+
+            ByteArrayOutputStream payload = new ByteArrayOutputStream();
+            payload.write(0);
+            payload.write(5);
+            byte[] protoBytes = proto.toByteArray();
+            payload.write(protoBytes, 0, protoBytes.length);
+            byte[] fullPayload = payload.toByteArray();
+            if (fullPayload.length > 4096) throw new IOException("Discovery payload too large");
+
+            ByteArrayOutputStream wire = new ByteArrayOutputStream();
+            wire.write(0); // control channel
+            wire.write(3); // unencrypted, final frame
+            wire.write((fullPayload.length >> 8) & 0xff);
+            wire.write(fullPayload.length & 0xff);
+            wire.write(fullPayload, 0, fullPayload.length);
+            frame = wire.toByteArray();
+        } catch (Exception ex) {
+            append("Не удалось сформировать ServiceDiscoveryRequest: " + ex);
+            return;
+        }
+
+        discoveryRequestSent = true;
+        final ParcelFileDescriptor opened = descriptor;
+        new Thread(() -> {
+            try {
+                synchronized (MainActivity.this) {
+                    if (!listening || descriptor != opened) {
+                        discoveryRequestSent = false;
+                        append("USB-сессия закрыта, SERVICE_DISCOVERY не отправлен.");
+                        return;
+                    }
+                    FileOutputStream output = new FileOutputStream(opened.getFileDescriptor());
+                    output.write(frame);
+                    output.flush();
+                }
+                append("TX SERVICE_DISCOVERY_REQUEST ID=5, manufacturer=" + manufacturer
+                        + ", model=" + model + ", Android=" + version + ", device=" + name
+                        + ", resolution=" + width + "x" + height + ": "
+                        + hex(frame, frame.length));
+                append("Ожидаю SERVICE_DISCOVERY_RESPONSE (ID 6). Никаких последующих команд без нового исследования.");
+            } catch (Exception ex) {
+                discoveryRequestSent = false;
+                append("Ошибка SERVICE_DISCOVERY_REQUEST: " + ex);
+            }
+        }, "aoa-service-discovery").start();
+    }
+
+    private static void putString(ByteArrayOutputStream out, int field, String value) throws IOException {
+        byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
+        if (bytes.length > 255) throw new IOException("Phone info field exceeds 255 bytes");
+        putVarint(out, (field << 3) | 2);
+        putVarint(out, bytes.length);
+        out.write(bytes);
+    }
+
+    private static void putVarint(ByteArrayOutputStream out, int value) {
+        long unsignedValue = value & 0xffffffffL;
+        while ((unsignedValue & ~0x7fL) != 0) {
+            out.write(((int) unsignedValue & 0x7f) | 0x80);
+            unsignedValue >>>= 7;
+        }
+        out.write((int) unsignedValue);
     }
 
     private void respondAuth() {
