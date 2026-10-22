@@ -34,8 +34,7 @@ import java.util.Date;
 import java.util.Locale;
 
 /**
- * An intentionally receive-only Android Open Accessory monitor.
- * Never transmits packets to the attached head unit.
+ * Diagnostic AOA probe; only known handshake replies can be transmitted.
  */
 public final class MainActivity extends Activity {
     private static final String USB_PERMISSION = "com.example.autolinkprobe.USB_PERMISSION";
@@ -309,11 +308,15 @@ public final class MainActivity extends Activity {
             int msgId = ((frame[4] & 0xff) << 8) | (frame[5] & 0xff);
             if (Arrays.equals(frame, VERSION_REQUEST)) {
                 versionRequestSeen = true;
-                append("Кадр VERSION_REQUEST 1.10 подтверждён. Нажми кнопку 3.");
+                append("Кадр VERSION_REQUEST 1.10 подтверждён." +
+                        (autoHandshake ? " Автотест отвечает 1.11." : " Нажми кнопку 3."));
+                if (autoHandshake) respondVersion();
             } else if (Arrays.equals(frame, ENCAPSULATED_SSL)) {
                 if (versionReplySent) {
                     encapsulatedSslSeen = true;
-                    append("Кадр ENCAPSULATED_SSL (ID 3, 00 00) подтверждён. Оригинальный AutoLink отвечает AUTH_RESPONSE(status=0). Нажми кнопку 4.");
+                    append("Кадр ENCAPSULATED_SSL (ID 3, 00 00) подтверждён." +
+                            (autoHandshake ? " Автотест отправит AUTH_RESPONSE." : " Нажми кнопку 4."));
+                    if (autoHandshake) respondAuth();
                 } else {
                     append("Сообщение ID 3 пришло до ответа версии; AUTH_RESPONSE заблокирован");
                 }
@@ -332,6 +335,22 @@ public final class MainActivity extends Activity {
         if (incomingFrames.size() > MAX_READ) {
             append("Превышен лимит накопленных данных, сброс");
             incomingFrames.reset();
+        }
+    }
+
+    private void enableAutoTest() {
+        autoHandshake = true;
+        append("Автотест разрешён: отправляем максимум 1 VERSION_RESPONSE и 1 AUTH_RESPONSE, " +
+                "только после ТОЧНОГО совпадения входящих запросов. Неизвестным пакетам не отвечаем.");
+        if (!listening) {
+            start();
+        } else if (versionRequestSeen && !versionReplySent) {
+            respondVersion();
+        } else if (encapsulatedSslSeen && !authReplySent) {
+            respondAuth();
+        } else if (totalRead == 0) {
+            append("USB уже открыт, но первые байты не пришли. " +
+                    "Вытащи кабель на 5 секунд и подключи заново — на входящем ATTACHED откроем порт автоматически.");
         }
     }
 
