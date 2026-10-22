@@ -83,7 +83,10 @@ final class SpeedometerDashboard {
     void draw(Canvas canvas, int width, int height) {
         canvas.save();
         canvas.drawColor(0xff030a10);
-        canvas.scale(width / (float) W, height / (float) H);
+        // Tablets have many different screen sizes; preserve gauge proportions.
+        float scale = Math.min(width / (float) W, height / (float) H);
+        canvas.translate((width - W * scale) / 2f, (height - H * scale) / 2f);
+        canvas.scale(scale, scale);
         Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
         p.setFilterBitmap(true);
         canvas.drawBitmap(background, 0, 0, p);
