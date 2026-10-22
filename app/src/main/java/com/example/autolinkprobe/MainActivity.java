@@ -13,6 +13,8 @@ import android.hardware.usb.UsbManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.ParcelFileDescriptor;
+import android.os.Handler;
+import android.os.Looper;
 import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
@@ -45,7 +47,10 @@ public final class MainActivity extends Activity {
     private UsbAccessory selected;
     private ParcelFileDescriptor descriptor;
     private volatile boolean listening;
-    private int totalRead;
+    private volatile int totalRead;
+    private volatile int sessionId;
+    private volatile boolean autoHandshake;
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private volatile boolean versionRequestSeen;
     private volatile boolean versionReplySent;
     private volatile boolean encapsulatedSslSeen;
@@ -85,6 +90,7 @@ public final class MainActivity extends Activity {
         root.addView(label("Только чтение USB. Не изменяет прошивку магнитолы и ничего ей не отправляет."));
         addButton(root, "1. Найти USB-аксессуар", this::scan);
         addButton(root, "2. Слушать USB (не больше 64 КБ)", this::start);
+        addButton(root, "Автотест: пройти 2 известных шага", this::enableAutoTest);
         addButton(root, "3. Ответить VERSION_RESPONSE 1.11 (один раз)", this::respondVersion);
         addButton(root, "4. Ответить AUTH_RESPONSE (status=0)", this::respondAuth);
         addButton(root, "Остановить чтение", this::stopReading);
@@ -112,6 +118,12 @@ public final class MainActivity extends Activity {
         append("Android " + Build.VERSION.RELEASE + ", SDK " + Build.VERSION.SDK_INT);
         append("Стартовый intent: " + getIntent().getAction());
         scan();
+        if (selected != null) {
+            append("USB уже подключён при запуске — автоматически начинаю чтение.");
+            start();
+        } else {
+            append("Ожидаю USB магнитолы. Лучше подключать кабель после запуска приложения.");
+        }
     }
 
     private TextView label(String content) {
@@ -184,7 +196,7 @@ public final class MainActivity extends Activity {
         }
     }
 
-    private void openAccessory() {
+    private synchronized void openAccessory() {
         if (selected == null || listening) return;
         try {
             descriptor = usb.openAccessory(selected);
@@ -193,6 +205,7 @@ public final class MainActivity extends Activity {
                 return;
             }
             final ParcelFileDescriptor opened = descriptor;
+            final int thisSession = ++sessionId;
             listening = true;
             totalRead = 0;
             versionRequestSeen = false;
@@ -200,26 +213,48 @@ public final class MainActivity extends Activity {
             encapsulatedSslSeen = false;
             authReplySent = false;
             incomingFrames.reset();
-            append("Порт открыт. Только входящий поток; никаких команд и handshake.");
+            append("Порт открыт, сессия " + thisSession + ". Читаем RX; передача только по известным запросам.");
+            mainHandler.postDelayed(() -> {
+                if (listening && sessionId == thisSession && totalRead == 0) {
+                    append("USB открыт 7 секунд, но RX = 0 байт. Ничего не отправляем наугад. Переподключи кабель и открой AutoLink на магнитоле.");
+                }
+            }, 7000);
+            mainHandler.postDelayed(() -> {
+                if (listening && sessionId == thisSession && totalRead == 0) {
+                    append("USB открыт 20 секунд, но RX = 0. Это ожидание данных, а НЕ ошибка разбора. Нужно новое подключение.");
+                }
+            }, 20000);
             new Thread(() -> {
                 try (FileInputStream input = new FileInputStream(opened.getFileDescriptor())) {
                     byte[] buffer = new byte[1024];
 
                     int count;
-                    while (listening && totalRead < MAX_READ
+                    while (listening && sessionId == thisSession && totalRead < MAX_READ
                             && (count = input.read(buffer)) != -1) {
                         totalRead += count;
-                        processIncomingFrames(buffer, count);
                         int hexLength = Math.min(count, 256);
                         append("RX " + count + " байт: " + hex(buffer, hexLength)
                                 + (count > hexLength ? " [остальное опущено]" : ""));
+                        try {
+                            processIncomingFrames(buffer, count);
+                        } catch (RuntimeException ex) {
+                            append("Ошибка разбора RX (сырые байты сохранены): " + ex);
+                            incomingFrames.reset();
+                        }
                     }
                 } catch (IOException ex) {
                     if (listening) append("Ошибка чтения: " + ex.getMessage());
                 } finally {
-                    listening = false;
-                    append("Чтение завершено; принято " + totalRead + " байт");
-                    closeDescriptor();
+                    synchronized (MainActivity.this) {
+                        if (sessionId == thisSession) {
+                            listening = false;
+                            append("Чтение завершено; принято " + totalRead + " байт");
+                            closeDescriptor();
+                        } else {
+                            try { opened.close(); } catch (IOException ignored) {}
+                            append("Предыдущая USB-сессия " + thisSession + " закрыта.");
+                        }
+                    }
                 }
             }, "aoa-usb-reader").start();
         } catch (Exception ex) {
@@ -391,7 +426,8 @@ public final class MainActivity extends Activity {
         }
     }
 
-    private void stopReading() {
+    private synchronized void stopReading() {
+        sessionId++;
         listening = false;
         closeDescriptor();
     }
@@ -424,7 +460,15 @@ public final class MainActivity extends Activity {
         super.onNewIntent(intent);
         setIntent(intent);
         append("Новый intent: " + intent.getAction());
+        if (UsbManager.ACTION_USB_ACCESSORY_ATTACHED.equals(intent.getAction()) && listening) {
+            append("Новый USB ATTACHED — закрываю старую сессию.");
+            stopReading();
+        }
         scan();
+        if (selected != null && UsbManager.ACTION_USB_ACCESSORY_ATTACHED.equals(intent.getAction())) {
+            append("AOA ATTACHED — автоматически открываю USB.");
+            start();
+        }
     }
 
     @Override protected void onDestroy() {
