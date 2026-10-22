@@ -3,6 +3,9 @@ package com.example.autolinkprobe;
 import android.Manifest;
 import android.content.pm.PackageManager;
 import android.app.Activity;
+import android.app.ActivityManager;
+import android.app.ActivityOptions;
+import android.content.ActivityNotFoundException;
 import android.app.PendingIntent;
 import android.content.BroadcastReceiver;
 import android.content.ClipData;
@@ -80,6 +83,7 @@ public final class MainActivity extends Activity {
     private TextView logView;
     private EditText scriptEditor;
     private EditText destinationInput;
+    private TextView gisTestStatus;
     private volatile boolean routeRequestActive;
     private final ProtocolScript script = new ProtocolScript();
     private volatile boolean scriptEnabled;
@@ -152,6 +156,10 @@ public final class MainActivity extends Activity {
         destinationInput.setText(getPreferences(MODE_PRIVATE).getString("nav_destination", ""));
         root.addView(destinationInput);
         addButton(root, "8. Построить маршрут на магнитоле", this::buildNavigationRoute);
+        addButton(root, "9. ТЕСТ: открыть настоящий 2ГИС на магнитоле", this::testLaunch2GisOnDisplay);
+        gisTestStatus = label("2ГИС: тест ещё не запускали.");
+        gisTestStatus.setTextSize(14);
+        root.addView(gisTestStatus);
         root.addView(label("Тестовый маршрут: адрес ищет служба Android, координаты поездки "
                 + "передаются демосерверу OSRM. Нет пробок, голоса и автоперестроения. "
                 + "Вводи адрес, только когда машина стоит."));
@@ -557,6 +565,74 @@ public final class MainActivity extends Activity {
                 Toast.makeText(MainActivity.this, message, Toast.LENGTH_LONG).show();
             }
         });
+    }
+
+    /**
+     * Diagnostic only. Ask Android whether a *third-party* Activity may appear
+     * on the existing private encoder-backed display. Never launch on the phone
+     * as fallback: that would spoil this test and steal the user's screen.
+     */
+    private void testLaunch2GisOnDisplay() {
+        final String packageName = "ru.dublgis.dgismobile";
+        int displayId = videoSession.navigationDisplayId();
+        boolean multiDisplay = getPackageManager().hasSystemFeature(
+                PackageManager.FEATURE_ACTIVITIES_ON_SECONDARY_DISPLAYS);
+        append("2GIS TEST: Android=" + Build.VERSION.SDK_INT
+                + " supportsSecondaryActivities=" + multiDisplay
+                + " privateVirtualDisplayId=" + displayId);
+        if (displayId < 0) {
+            reportGisTest("Сначала нажми 7, подключи USB и дождись карты на магнитоле. "
+                    + "Повторно USB-подключать для этого теста не нужно.");
+            return;
+        }
+        if (!multiDisplay) {
+            reportGisTest("Android не объявляет поддержку запуска Activities на втором дисплее. "
+                    + "2ГИС на телефоне не открываю.");
+            return;
+        }
+        Intent launch = getPackageManager().getLaunchIntentForPackage(packageName);
+        if (launch == null) {
+            reportGisTest("Пакет ru.dublgis.dgismobile не найден или у него нет открываемой Activity. "
+                    + "Убедись, что обычный 2ГИС установлен на телефоне.");
+            return;
+        }
+        launch.setPackage(packageName);
+        // Force a fresh task on the secondary display instead of moving the
+        // user's already-running 2GIS task away from the primary phone display.
+        launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_MULTIPLE_TASK);
+        try {
+            ActivityManager manager = (ActivityManager) getSystemService(ACTIVITY_SERVICE);
+            boolean allowed = manager != null &&
+                    manager.isActivityStartAllowedOnDisplay(this, displayId, launch);
+            append("2GIS TEST: isActivityStartAllowedOnDisplay(" + displayId + ")=" + allowed);
+            if (!allowed) {
+                reportGisTest("Android запретил запуск чужого приложения на нашем виртуальном "
+                        + "дисплее (isActivityStartAllowedOnDisplay=false). Это системная "
+                        + "защита, а не ошибка AutoLink или карты.");
+                return;
+            }
+            ActivityOptions options = ActivityOptions.makeBasic();
+            options.setLaunchDisplayId(displayId);
+            startActivity(launch, options.toBundle());
+            reportGisTest("Команда запуска 2ГИС отправлена на экран #" + displayId
+                    + ". Посмотри, появился ли 2ГИС на Газели. "
+                    + "Сама команда ещё не доказывает, что окно открылось.");
+        } catch (SecurityException error) {
+            reportGisTest("Android отклонил запуск 2ГИС: " + error.getClass().getSimpleName()
+                    + ": " + String.valueOf(error.getMessage()));
+        } catch (ActivityNotFoundException error) {
+            reportGisTest("Не найдена открываемая Activity 2ГИС: " + error.getMessage());
+        } catch (RuntimeException error) {
+            reportGisTest("Сбой запуска на втором дисплее: "
+                    + error.getClass().getSimpleName() + ": " + error.getMessage());
+        }
+    }
+
+    private void reportGisTest(String message) {
+        String line = "2GIS TEST: " + message;
+        append(line);
+        if (gisTestStatus != null) gisTestStatus.setText(line);
+        Toast.makeText(this, message, Toast.LENGTH_LONG).show();
     }
 
     private void startNavigationTest() {
