@@ -354,7 +354,7 @@ final class AutoLinkVideoSession {
                                 DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION);
                         if (vd == null) throw new IllegalStateException("createVirtualDisplay вернул null");
                         navigationDisplay = vd;
-                        NavigatorPresentation screen = new NavigatorPresentation(context, vd.getDisplay());
+                        NavigatorPresentation screen = new NavigatorPresentation(context, vd.getDisplay(), sink::log);
                         navigationView = screen;
                         screen.show();
                         if (plannedRoute != null) screen.setRoute(plannedRoute);
