@@ -1,5 +1,6 @@
 package com.example.autolinkprobe;
 
+import android.Manifest;
 import android.app.Activity;
 import android.app.PendingIntent;
 import android.content.BroadcastReceiver;
@@ -12,6 +13,16 @@ import android.hardware.usb.UsbAccessory;
 import android.hardware.usb.UsbManager;
 import android.os.Build;
 import android.os.Bundle;
+import android.content.pm.PackageManager;
+import android.graphics.Canvas;
+import android.location.Location;
+import android.location.LocationListener;
+import android.location.LocationManager;
+import android.view.Gravity;
+import android.view.View;
+import android.view.ViewGroup;
+import android.view.WindowManager;
+import android.widget.FrameLayout;
 import android.os.ParcelFileDescriptor;
 import android.os.Handler;
 import android.os.Looper;
@@ -42,9 +53,16 @@ import java.util.Locale;
 public final class MainActivity extends Activity {
     private static final String USB_PERMISSION = "com.example.autolinkprobe.USB_PERMISSION";
     private static final int CREATE_LOG = 100;
+    private static final int LOCATION_REQUEST = 202;
     private static final int MAX_READ = 65536;
     private static final int MAX_LOG_CHARS = 160000;
 
+    private final SpeedometerDashboard dashboard = new SpeedometerDashboard();
+    private View dashboardPreview;
+    private ScrollView diagnosticsView;
+    private TextView connectionStatus;
+    private LocationManager locationManager;
+    private LocationListener gpsListener;
     private UsbManager usb;
     private UsbAccessory selected;
     private ParcelFileDescriptor descriptor;
@@ -67,7 +85,7 @@ public final class MainActivity extends Activity {
             new AutoLinkVideoSession.Sink() {
                 @Override public void send(byte[] packet) throws IOException { sendVideoPacket(packet); }
                 @Override public void log(String line) { append(line); }
-            });
+            }, dashboard);
     private final ByteArrayOutputStream incomingFrames = new ByteArrayOutputStream();
     private TextView logView;
     private EditText scriptEditor;
@@ -102,8 +120,8 @@ public final class MainActivity extends Activity {
         root.setPadding(margin, margin, margin, margin);
         scroll.addView(root);
 
-        root.addView(label("AutoLink USB Probe"));
-        root.addView(label("USB-диагностика и экспериментальная передача H.264 на магнитолу. Кнопка 6 запускает полный обмен."));
+        root.addView(label("Диагностика AutoLink — необязательно для запуска спидометра"));
+        root.addView(label("USB-протокол пока экспериментальный. Журнал и ручные команды оставлены для проверки магнитолы."));
         root.addView(label("Сценарий обмена (можно менять БЕЗ переустановки APK):"));
         scriptEditor = new EditText(this);
         scriptEditor.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
@@ -126,7 +144,7 @@ public final class MainActivity extends Activity {
         addButton(root, "3. Ответить VERSION_RESPONSE 1.11 (один раз)", this::respondVersion);
         addButton(root, "4. Ответить AUTH_RESPONSE (status=0)", this::respondAuth);
         addButton(root, "5. Запросить сервисы магнитолы (SERVICE_DISCOVERY)", this::sendServiceDiscovery);
-        addButton(root, "6. Передать H.264 тест-картинку на магнитолу", this::startVideoTest);
+        addButton(root, "6. Запустить передачу спидометра H.264", this::startVideoTest);
         addButton(root, "Режим видеопакетов: переключить 0x0B / 0x03", () -> {
             if (listening && discoveryResponseSeen) {
                 append("VIDEO: переключение режима только до новой USB-сессии. Отключи кабель.");
@@ -155,7 +173,57 @@ public final class MainActivity extends Activity {
         logView = label("Подключи телефон по USB и нажми «Найти USB-аксессуар».");
         logView.setTextIsSelectable(true);
         root.addView(logView);
-        setContentView(scroll);
+        // Same Canvas renderer powers this phone preview and the independent
+        // 1280x720 MediaCodec Surface sent via USB to the head unit.
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        FrameLayout stage = new FrameLayout(this);
+        dashboardPreview = new View(this) {
+            @Override protected void onDraw(Canvas canvas) {
+                super.onDraw(canvas);
+                dashboard.draw(canvas, getWidth(), getHeight());
+                postInvalidateDelayed(150);
+            }
+        };
+        stage.addView(dashboardPreview, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        diagnosticsView = scroll;
+        scroll.setBackgroundColor(0xff061019);
+        scroll.setVisibility(View.GONE);
+        stage.addView(scroll, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        LinearLayout controls = new LinearLayout(this);
+        controls.setOrientation(LinearLayout.HORIZONTAL);
+        controls.setGravity(Gravity.CENTER_VERTICAL);
+        controls.setPadding(10, 4, 10, 4);
+        controls.setBackgroundColor(0xdd07121c);
+        connectionStatus = new TextView(this);
+        connectionStatus.setText("Подключи USB магнитолы");
+        connectionStatus.setTextColor(0xffb4dce3);
+        connectionStatus.setTextSize(12);
+        controls.addView(connectionStatus, new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+        Button connect = new Button(this);
+        connect.setText("ПОДКЛЮЧИТЬ");
+        connect.setTextSize(11);
+        connect.setOnClickListener(v -> startVideoTest());
+        controls.addView(connect);
+        Button toggle = new Button(this);
+        toggle.setText("⚙");
+        toggle.setContentDescription("Открыть или закрыть USB-диагностику");
+        toggle.setOnClickListener(v -> {
+            boolean opening = diagnosticsView.getVisibility() != View.VISIBLE;
+            diagnosticsView.setVisibility(opening ? View.VISIBLE : View.GONE);
+            if (opening) {
+                synchronized (log) { logView.setText(log.toString()); }
+            }
+        });
+        controls.addView(toggle);
+        FrameLayout.LayoutParams controlParams = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.BOTTOM);
+        stage.addView(controls, controlParams);
+        setContentView(stage);
+        startGps();
 
         IntentFilter events = new IntentFilter(USB_PERMISSION);
         events.addAction(UsbManager.ACTION_USB_ACCESSORY_DETACHED);
@@ -168,12 +236,9 @@ public final class MainActivity extends Activity {
         append("Android " + Build.VERSION.RELEASE + ", SDK " + Build.VERSION.SDK_INT);
         append("Стартовый intent: " + getIntent().getAction());
         scan();
-        if (selected != null) {
-            append("USB уже подключён при запуске — автоматически начинаю чтение.");
-            start();
-        } else {
-            append("Ожидаю USB магнитолы. Лучше подключать кабель после запуска приложения.");
-        }
+        // One-step launch: arm the known USB sequence and wait for attachment.
+        // Still no unverified native packets are sent without the expected RX.
+        startVideoTest();
     }
 
     private TextView label(String content) {
@@ -202,7 +267,8 @@ public final class MainActivity extends Activity {
             snapshot = log.toString();
         }
         runOnUiThread(() -> {
-            if (logView != null) logView.setText(snapshot);
+            if (logView != null && diagnosticsView != null
+                    && diagnosticsView.getVisibility() == View.VISIBLE) logView.setText(snapshot);
         });
     }
 
@@ -257,6 +323,9 @@ public final class MainActivity extends Activity {
             final ParcelFileDescriptor opened = descriptor;
             final int thisSession = ++sessionId;
             listening = true;
+            runOnUiThread(() -> {
+                if (connectionStatus != null) connectionStatus.setText("USB подключён • согласование видео");
+            });
             totalRead = 0;
             versionRequestSeen = false;
             versionReplySent = false;
@@ -310,6 +379,9 @@ public final class MainActivity extends Activity {
                             authCompleteSeen = false;
                             discoveryRequestSent = false;
                             append("Чтение завершено; принято " + totalRead + " байт");
+                            runOnUiThread(() -> {
+                                if (connectionStatus != null) connectionStatus.setText("USB отключён");
+                            });
                             closeDescriptor();
                         } else {
                             try { opened.close(); } catch (IOException ignored) {}
@@ -467,7 +539,7 @@ public final class MainActivity extends Activity {
         script.stop();
         scriptEnabled = false;
         autoHandshake = true;
-        append("VIDEO: тест разрешён. Авто VERSION/AUTH/SDP, затем CHANNEL_OPEN/SETUP/FOCUS и H.264.");
+        append("VIDEO: спидометр разрешён. Авто VERSION/AUTH/SDP, затем CHANNEL_OPEN/SETUP/FOCUS и H.264.");
         videoSession.setMirrorPeerFlag(videoFlag0B);
         if (!listening || descriptor == null) {
             append("VIDEO: USB не подключён; жду новое подключение.");
@@ -753,6 +825,47 @@ public final class MainActivity extends Activity {
         sessionId++;
         listening = false;
         closeDescriptor();
+        runOnUiThread(() -> {
+            if (connectionStatus != null) connectionStatus.setText("USB отключён");
+        });
+    }
+
+    /** GPS operates fully offline; do not display invented zero if fixes are stale. */
+    private void startGps() {
+        if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION)
+                != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.ACCESS_FINE_LOCATION}, LOCATION_REQUEST);
+            return;
+        }
+        if (locationManager == null) {
+            locationManager = (LocationManager) getSystemService(LOCATION_SERVICE);
+            gpsListener = new LocationListener() {
+                @Override public void onLocationChanged(Location location) {
+                    dashboard.onLocation(location);
+                    if (dashboardPreview != null) dashboardPreview.invalidate();
+                }
+                @Override public void onStatusChanged(String provider, int status, Bundle extras) {}
+                @Override public void onProviderEnabled(String provider) {}
+                @Override public void onProviderDisabled(String provider) {}
+            };
+        }
+        try {
+            locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER,
+                    300L, 0f, gpsListener, Looper.getMainLooper());
+        } catch (IllegalArgumentException | SecurityException e) {
+            append("GPS недоступен: " + e.getMessage());
+        }
+    }
+
+    @Override public void onRequestPermissionsResult(int requestCode, String[] permissions,
+            int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == LOCATION_REQUEST && grantResults.length > 0
+                && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+            startGps();
+        } else if (requestCode == LOCATION_REQUEST) {
+            append("Нет разрешения GPS — скорость будет показана как прочерк.");
+        }
     }
 
     private void exportLog() {
@@ -800,6 +913,9 @@ public final class MainActivity extends Activity {
     }
 
     @Override protected void onDestroy() {
+        if (locationManager != null && gpsListener != null) {
+            locationManager.removeUpdates(gpsListener);
+        }
         stopReading();
         unregisterReceiver(receiver);
         super.onDestroy();
