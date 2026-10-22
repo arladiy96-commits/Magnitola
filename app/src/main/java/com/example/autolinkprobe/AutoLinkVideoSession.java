@@ -31,6 +31,14 @@ final class AutoLinkVideoSession {
     private NavigatorPresentation navigationView;
     private volatile RoutePlanner.Route plannedRoute;
 
+    void clearRoute() {
+        plannedRoute = null;
+        ui.post(() -> {
+            NavigatorPresentation screen = navigationView;
+            if (screen != null && screen.isShowing()) screen.clearRoute();
+        });
+    }
+
     void setRoute(RoutePlanner.Route route) {
         plannedRoute = route;
         ui.post(() -> {
@@ -350,7 +358,7 @@ final class AutoLinkVideoSession {
                         navigationView = screen;
                         screen.show();
                         if (plannedRoute != null) screen.setRoute(plannedRoute);
-                        sink.log("NAV: отдельная карта OSM запущена, " + width + "x" + height
+                        sink.log("NAV: векторная карта MapLibre запущена, " + width + "x" + height
                                 + "; экран телефона НЕ зеркалируется");
                     } catch (Exception e) {
                         sink.log("NAV: ошибка создания виртуального экрана: " + e);
