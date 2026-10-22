@@ -12,6 +12,7 @@
         android:allowBackup="false"
         android:theme="@android:style/Theme.Material.Light.NoActionBar"
         android:usesCleartextTraffic="false">
+        <activity android:name=".MapDiagnosticsActivity" android:exported="false" />
         <service android:name=".NavigationLocationService" android:exported="false"
                  android:foregroundServiceType="location" />
         <activity android:name=".MainActivity" android:exported="true" android:launchMode="singleTop">
