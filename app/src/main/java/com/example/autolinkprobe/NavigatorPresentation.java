@@ -85,10 +85,18 @@ final class NavigatorPresentation extends Presentation {
                 report.accept("КАРТА: MapSnapshotter завис дольше 18 с, пересоздаю рендерер");
                 replaceSnapshotter();
             }
-            if (!snapshotInFlight && lastFix != null) {
-                boolean moving = lastFix.hasSpeed() && lastFix.getSpeed() > 1.3f;
+            Location currentFix = lastFix;
+            boolean fresh = currentFix != null && SystemClock.elapsedRealtimeNanos()
+                    - currentFix.getElapsedRealtimeNanos() <= 12_000_000_000L;
+            if (!fresh) {
+                speedValue.setText("—");
+                gpsState.setText("GPS: нет сигнала");
+                gpsState.setTextColor(0xFFFFBC9A);
+            } else if (!snapshotInFlight) {
+                boolean moving = currentFix.hasSpeed() && currentFix.getSpeed() > 1.3f;
                 long minDelay = moving ? 1500L : 7500L;
-                if (snapshotCount == 0 || SystemClock.elapsedRealtime() - latestBitmapAt >= minDelay) {
+                if (snapshotCount == 0
+                        || SystemClock.elapsedRealtime() - latestBitmapAt >= minDelay) {
                     takeSnapshot();
                 }
             }
