@@ -1,6 +1,7 @@
 package com.example.autolinkprobe;
 
 import android.content.Context;
+import android.location.Location;
 import android.hardware.display.DisplayManager;
 import android.hardware.display.VirtualDisplay;
 import android.os.Handler;
@@ -28,6 +29,22 @@ final class AutoLinkVideoSession {
     private volatile boolean navigationMode;
     private VirtualDisplay navigationDisplay;
     private NavigatorPresentation navigationView;
+    private volatile RoutePlanner.Route plannedRoute;
+
+    void setRoute(RoutePlanner.Route route) {
+        plannedRoute = route;
+        ui.post(() -> {
+            NavigatorPresentation screen = navigationView;
+            if (screen != null && screen.isShowing() && route == plannedRoute) {
+                screen.setRoute(route);
+            }
+        });
+    }
+
+    Location currentLocation() {
+        NavigatorPresentation screen = navigationView;
+        return screen == null ? null : screen.latestLocation();
+    }
 
     synchronized boolean setNavigationMode(boolean enabled) {
         if (streaming || channel > 0) return false;
@@ -332,6 +349,7 @@ final class AutoLinkVideoSession {
                         NavigatorPresentation screen = new NavigatorPresentation(context, vd.getDisplay());
                         navigationView = screen;
                         screen.show();
+                        if (plannedRoute != null) screen.setRoute(plannedRoute);
                         sink.log("NAV: отдельная карта OSM запущена, " + width + "x" + height
                                 + "; экран телефона НЕ зеркалируется");
                     } catch (Exception e) {
