@@ -286,9 +286,9 @@ final class AutoLinkVideoSession {
         try {
             MediaFormat format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, 1280, 720);
             format.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface);
-            format.setInteger(MediaFormat.KEY_BIT_RATE, 1200000);
+            format.setInteger(MediaFormat.KEY_BIT_RATE, 3500000);
             format.setInteger(MediaFormat.KEY_FRAME_RATE, FPS);
-            format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1);
+            format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2);
             format.setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline);
             codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC);
             codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
