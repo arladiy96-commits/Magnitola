@@ -41,7 +41,7 @@ jobs:
               for sym in symsect.iter_symbols():
                   if sym.name and sym['st_value']:
                       symbols[sym.name] = (sym['st_value'], sym['st_size'])
-          keys=('VideoSource', 'MessageRouter', 'ChannelManager', 'sendPingResponse', 'routeMessage', 'handleChannel')
+          keys=('VideoSource', 'MessageRouter', 'ChannelManager', 'MediaSourceBase', 'sendPingResponse', 'routeMessage', 'handleChannel')
           selected=[(name,a,n) for name,(a,n) in symbols.items() if any(k in name for k in keys)]
           md=Cs(CS_ARCH_ARM64,CS_MODE_ARM)
           output=[]
@@ -54,9 +54,9 @@ jobs:
               log(f'SYMBOL 0x{a:08x} size={size} {name}')
           log('\nDISASSEMBLY SELECTED:')
           subset=[(name,a,size) for name,a,size in selected if any(k in name.lower() for k in
-                    ('videosource', 'sendpingresponse', 'queueoutgoing', 'marshallproto', 'channelmanager'))]
+                    ('videosource', 'mediasourcebase', 'sendpingresponse', 'queueoutgoing', 'marshallproto', 'channelmanager', 'sendchannelopenrequest'))]
           # Bound length to avoid unnecessary storage of disassembly from the vendor library.
-          for name,a,size in subset[:60]:
+          for name,a,size in subset[:125]:
               log(f'\n--- {name}, vaddr=0x{a:x} size={size} ---')
               seg=next((p for p in segs if int(p['p_vaddr'])<=a<int(p['p_vaddr'])+int(p['p_filesz'])),None)
               if seg is None: continue
