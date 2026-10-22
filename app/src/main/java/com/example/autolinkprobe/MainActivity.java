@@ -218,11 +218,27 @@ public final class MainActivity extends Activity {
     private void addButton(LinearLayout root, String name, Runnable action) {
         Button button = new Button(this);
         button.setText(name);
+        button.setAllCaps(false);
+        button.setTextSize(17);
+        button.setTextColor(0xFFFFFFFF);
+        button.setPadding(14, 16, 14, 16);
+        int background = name.contains("Запустить") ? 0xFF127DCC
+                : name.contains("Остановить") ? 0xFF69343C : 0xFF244157;
+        button.setBackgroundTintList(android.content.res.ColorStateList.valueOf(background));
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        params.setMargins(0, 11, 0, 4);
+        root.addView(button, params);
         button.setOnClickListener(view -> action.run());
-        root.addView(button);
     }
 
     private void append(String message) {
+        if (message.startsWith("NAV: векторная карта")) {
+            setStatus("Карта на магнитоле работает • можно заблокировать телефон.");
+        } else if (message.startsWith("NAV: ошибка") ||
+                message.startsWith("VIDEO: MediaCodec ошибка")) {
+            setStatus(message);
+        }
         String line = new SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
                 .format(new Date()) + " " + message + "\n";
         boolean schedule;
@@ -549,6 +565,7 @@ public final class MainActivity extends Activity {
                     return;
                 }
                 videoSession.setRoute(route);
+                setStatus("Маршрут построен. На магнитоле идёт навигация.");
                 append(String.format(Locale.US,
                         "NAV: маршрут ПОСТРОЕН: %s, %.1f км, ~%.0f мин; "
                                 + "линия и ближайший поворот выводятся на магнитолу.",
