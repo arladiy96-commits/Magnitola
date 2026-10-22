@@ -7,6 +7,7 @@ import android.media.MediaCodec;
 import android.media.MediaCodecInfo;
 import android.media.MediaFormat;
 import android.os.SystemClock;
+import android.os.Build;
 import android.view.Surface;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -16,7 +17,9 @@ import java.util.Arrays;
 /** Experimental AutoLink H.264 video source, activated only by user. */
 final class AutoLinkVideoSession {
     interface Sink { void send(byte[] data) throws IOException; void log(String s); }
-    static final int WIDTH = 1280, HEIGHT = 720, FPS = 30;
+    static final int WIDTH = Build.VERSION.SDK_INT < 26 ? 960 : 1280;
+    static final int HEIGHT = Build.VERSION.SDK_INT < 26 ? 544 : 720;
+    static final int FPS = Build.VERSION.SDK_INT < 26 ? 20 : 30;
     private final Sink sink;
     private final SpeedometerDashboard dashboard;
     private volatile boolean streaming;
@@ -284,12 +287,15 @@ final class AutoLinkVideoSession {
 
     private void startCodec() {
         try {
-            MediaFormat format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, 1280, 720);
+            MediaFormat format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, WIDTH, HEIGHT);
             format.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface);
-            format.setInteger(MediaFormat.KEY_BIT_RATE, 3500000);
+            format.setInteger(MediaFormat.KEY_BIT_RATE,
+                    Build.VERSION.SDK_INT < 26 ? 1600000 : 3500000);
             format.setInteger(MediaFormat.KEY_FRAME_RATE, FPS);
             format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2);
-            format.setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline);
+            if (Build.VERSION.SDK_INT >= 26) {
+                format.setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline);
+            } // Android 7 codec implementations may reject an explicit profile.
             codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC);
             codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
             surface = codec.createInputSurface();
