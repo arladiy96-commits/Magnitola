@@ -18,6 +18,7 @@ final class AutoLinkVideoSession {
     interface Sink { void send(byte[] data) throws IOException; void log(String s); }
     static final int WIDTH = 1280, HEIGHT = 720, FPS = 30;
     private final Sink sink;
+    private final SpeedometerDashboard dashboard;
     private volatile boolean streaming;
     private volatile int channel = -1, pending = 0, maxPending = 1;
     private volatile int sent = 0, acked = 0;
@@ -33,7 +34,10 @@ final class AutoLinkVideoSession {
     private MediaCodec codec;
     private Surface surface;
 
-    AutoLinkVideoSession(Sink sink) { this.sink = sink; }
+    AutoLinkVideoSession(Sink sink, SpeedometerDashboard dashboard) {
+        this.sink = sink;
+        this.dashboard = dashboard;
+    }
 
     synchronized void setMirrorPeerFlag(boolean enabled) { mirrorPeerFlag = enabled; }
     boolean isMirrorPeerFlag() { return mirrorPeerFlag; }
@@ -292,34 +296,28 @@ final class AutoLinkVideoSession {
             codec.start();
             streaming = true;
             MediaCodec encoder = codec; Surface input = surface;
-            new Thread(() -> draw(input), "autolink-testcard").start();
+            new Thread(() -> draw(input), "autolink-speedometer").start();
             new Thread(() -> drain(encoder), "autolink-video-tx").start();
         } catch (Exception e) { sink.log("VIDEO: MediaCodec ошибка: " + e); stop(); }
     }
 
     private void draw(Surface input) {
-        Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
-        int[] colors = {Color.RED, Color.YELLOW, Color.GREEN, Color.CYAN,
-                Color.BLUE, Color.MAGENTA, Color.WHITE, Color.DKGRAY};
-        long index = 0;
         try {
             while (streaming) {
                 long begin = SystemClock.elapsedRealtime();
                 Canvas canvas = input.lockCanvas(null);
-                for (int c = 0; c < colors.length; c++) {
-                    paint.setColor(colors[c]);
-                    canvas.drawRect(c * 160, 0, (c + 1) * 160, 720, paint);
+                try {
+                    dashboard.draw(canvas, canvas.getWidth(), canvas.getHeight());
+                } finally {
+                    input.unlockCanvasAndPost(canvas);
                 }
-                paint.setColor(Color.BLACK); canvas.drawRect(80, 250, 1200, 450, paint);
-                paint.setColor(Color.WHITE); paint.setTextSize(70);
-                canvas.drawText("GAZ AutoLink H.264", 110, 333, paint);
-                paint.setTextSize(42);
-                canvas.drawText("1280x720 @ 30 FPS  Frame " + index++, 110, 406, paint);
-                input.unlockCanvasAndPost(canvas);
                 long left = 1000 / FPS - (SystemClock.elapsedRealtime() - begin);
                 if (left > 0) Thread.sleep(left);
             }
-        } catch (Exception e) { if (streaming) sink.log("VIDEO: Canvas ошибка: " + e); stop(); }
+        } catch (Exception e) {
+            if (streaming) sink.log("VIDEO: ошибка отрисовки спидометра: " + e);
+            stop();
+        }
     }
 
     private void drain(MediaCodec encoder) {
