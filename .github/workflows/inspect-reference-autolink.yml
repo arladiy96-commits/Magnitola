@@ -83,8 +83,8 @@ jobs:
               --output-dir /tmp/jadx-src /tmp/original-autolink.apk > /tmp/jadx.log 2>&1 || true
             {
               echo '=== Call sites sendStart/sendSetup/sendVideoFocus ==='
-              grep -R -n -E 'sendStart\\(|sendSetup\\(|sendVideoFocusRequestNotifi\\(' \
-                /tmp/jadx-src/sources/com/car/autolink/ 2>/dev/null | head -100 || true
+              grep -R -n -F 'sendStart(' \
+                /tmp/jadx-src/sources/ 2>/dev/null | head -140 || true
               echo '=== Java video protocol source file matches ==='
               find /tmp/jadx-src/sources/com/car/autolink -iname '*VideoSource*' \
                 -o -iname '*VideoService*' 2>/dev/null | head -20
@@ -92,8 +92,8 @@ jobs:
               grep -n -E 'native|send|class|interface' \
                 /tmp/jadx-src/sources/com/car/autolink/module/protocal/eightthree/project/VideoSource.java | head -130 || true
               echo '=== Context of sendStart call ==='
-              grep -R -n -B 6 -A 6 -E '\\.sendStart\\(' \
-                /tmp/jadx-src/sources/com/car/autolink 2>/dev/null | head -180 || true
+              grep -R -n -B 7 -A 7 -F '.sendStart(' \
+                /tmp/jadx-src/sources/ 2>/dev/null | head -250 || true
             } > diagnostic/java-call-sites.txt
             echo 'Java call site extraction complete'
           else
