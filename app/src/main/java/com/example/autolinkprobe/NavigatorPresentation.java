@@ -307,6 +307,27 @@ final class NavigatorPresentation extends Presentation {
         if (lastFix != null) updateManeuver(lastFix);
     }
 
+    void clearRoute() {
+        activeRoute = null;
+        metersToFinish = null;
+        lastRouteVertex = 0;
+        nextArrow.setText("↑");
+        nextDistance.setText("СВОБОДНАЯ ЕЗДА");
+        nextInstruction.setText("Маршрут не нужен — просто едь");
+        remainingText.setText("Карта по курсу");
+        freeModeHint.setText("Твоё положение и скорость");
+        etaText.setText("—:—");
+        etaCaption.setText("Время прибытия");
+        if (map != null && styleReady) {
+            Style style = map.getStyle();
+            if (style != null) {
+                if (style.getLayer("gaz-route-fill") != null) style.removeLayer("gaz-route-fill");
+                if (style.getLayer("gaz-route-outline") != null) style.removeLayer("gaz-route-outline");
+                if (style.getSource(ROUTE_SOURCE) != null) style.removeSource(ROUTE_SOURCE);
+            }
+        }
+    }
+
     private void installRoute(Style style, RoutePlanner.Route route) {
         try {
             // Drop layers before source; otherwise style errors on new routes.
