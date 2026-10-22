@@ -8,7 +8,7 @@ android {
         applicationId 'com.example.autolinkprobe'
         minSdk 26
         targetSdk 35
-        versionCode 4
-        versionName '0.4-gps-dashboard'
+        versionCode 5
+        versionName '0.5-premium-gps'
     }
 }
