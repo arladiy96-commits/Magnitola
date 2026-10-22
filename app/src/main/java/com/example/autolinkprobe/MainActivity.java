@@ -172,6 +172,17 @@ public final class MainActivity extends Activity {
             setStatus("Навигация остановлена. Запусти снова кнопкой выше.");
         });
 
+        TextView diagnosticHeading = label("Диагностика пустой карты");
+        diagnosticHeading.setTextColor(0xFFB8CDE1);
+        root.addView(diagnosticHeading);
+        TextView diagnostics = label("Если дорог на магнитоле нет — сравни "
+                + "с картой на телефоне. Это одна проверка, не старый USB-тестер.");
+        diagnostics.setTextSize(13);
+        diagnostics.setTextColor(0xFF9BB2C6);
+        root.addView(diagnostics);
+        addButton(root, "Проверить дороги на телефоне", () ->
+                startActivity(new Intent(this, MapDiagnosticsActivity.class)));
+
         TextView foot = label("Карта: MapLibre + OpenFreeMap.\n"
                 + "GPS работает через постоянное уведомление Android.\n"
                 + "Для загрузки новых дорог пока требуется интернет.");
@@ -235,7 +246,9 @@ public final class MainActivity extends Activity {
 
     private void append(String message) {
         if (message.startsWith("NAV: векторная карта")) {
-            setStatus("Карта на магнитоле работает • можно заблокировать телефон.");
+            setStatus("USB подключён. Проверяю загрузку дорог на магнитоле…");
+        } else if (message.startsWith("КАРТА МАГНИТОЛА:")) {
+            setStatus(message);
         } else if (message.startsWith("NAV: ошибка") ||
                 message.startsWith("VIDEO: MediaCodec ошибка")) {
             setStatus(message);
