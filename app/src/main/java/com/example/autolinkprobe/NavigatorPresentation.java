@@ -343,7 +343,10 @@ final class NavigatorPresentation extends Presentation {
             geo.put("geometry", new JSONObject().put("type", "LineString")
                     .put("coordinates", points));
             geo.put("properties", new JSONObject());
-            style.addSource(new GeoJsonSource(ROUTE_SOURCE, geo.toString()));
+            JSONObject collection = new JSONObject()
+                    .put("type", "FeatureCollection")
+                    .put("features", new JSONArray().put(geo));
+            style.addSource(new GeoJsonSource(ROUTE_SOURCE, collection.toString()));
             LineLayer casing = new LineLayer("gaz-route-outline", ROUTE_SOURCE);
             casing.setProperties(PropertyFactory.lineColor(Color.WHITE),
                     PropertyFactory.lineWidth(13f));
