@@ -49,7 +49,7 @@ public final class MainActivity extends Activity {
     private UsbAccessory selected;
     private ParcelFileDescriptor descriptor;
     private volatile boolean listening;
-    private volatile int totalRead;
+    private volatile long totalRead;
     private volatile int sessionId;
     private volatile boolean autoHandshake;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
@@ -59,6 +59,14 @@ public final class MainActivity extends Activity {
     private volatile boolean authReplySent;
     private volatile boolean authCompleteSeen;
     private volatile boolean discoveryRequestSent;
+    private volatile boolean discoveryResponseSeen;
+    private volatile boolean videoRequested;
+    private volatile int videoChannelId = -1;
+    private final AutoLinkVideoSession videoSession = new AutoLinkVideoSession(
+            new AutoLinkVideoSession.Sink() {
+                @Override public void send(byte[] packet) throws IOException { sendVideoPacket(packet); }
+                @Override public void log(String line) { append(line); }
+            });
     private final ByteArrayOutputStream incomingFrames = new ByteArrayOutputStream();
     private TextView logView;
     private EditText scriptEditor;
@@ -94,7 +102,7 @@ public final class MainActivity extends Activity {
         scroll.addView(root);
 
         root.addView(label("AutoLink USB Probe"));
-        root.addView(label("USB-диагностика. Пакеты отправляются только после явного запуска сценария или нажатия кнопок 3/4."));
+        root.addView(label("USB-диагностика и экспериментальная передача H.264 на магнитолу. Кнопка 6 запускает полный обмен."));
         root.addView(label("Сценарий обмена (можно менять БЕЗ переустановки APK):"));
         scriptEditor = new EditText(this);
         scriptEditor.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
@@ -112,11 +120,17 @@ public final class MainActivity extends Activity {
             append("Редактор восстановлен до известного сценария.");
         });
         addButton(root, "1. Найти USB-аксессуар", this::scan);
-        addButton(root, "2. Слушать USB (не больше 64 КБ)", this::start);
+        addButton(root, "2. Слушать USB", this::start);
         addButton(root, "Автотест: пройти 2 известных шага", this::enableAutoTest);
         addButton(root, "3. Ответить VERSION_RESPONSE 1.11 (один раз)", this::respondVersion);
         addButton(root, "4. Ответить AUTH_RESPONSE (status=0)", this::respondAuth);
         addButton(root, "5. Запросить сервисы магнитолы (SERVICE_DISCOVERY)", this::sendServiceDiscovery);
+        addButton(root, "6. Передать H.264 тест-картинку на магнитолу", this::startVideoTest);
+        addButton(root, "Остановить тестовое видео", () -> {
+            videoRequested = false;
+            videoSession.stop();
+            append("VIDEO: тест остановлен вручную.");
+        });
         addButton(root, "Остановить чтение", this::stopReading);
         addButton(root, "Сохранить лог в файл", this::exportLog);
         addButton(root, "Скопировать лог", () -> {
@@ -238,6 +252,9 @@ public final class MainActivity extends Activity {
             authReplySent = false;
             authCompleteSeen = false;
             discoveryRequestSent = false;
+            discoveryResponseSeen = false;
+            videoChannelId = -1;
+            videoSession.stop();
             incomingFrames.reset();
             if (scriptEnabled) script.onReconnect();
             append("Порт открыт, сессия " + thisSession + ". Читаем RX; передача только по известным запросам.");
@@ -256,7 +273,7 @@ public final class MainActivity extends Activity {
                     byte[] buffer = new byte[1024];
 
                     int count;
-                    while (listening && sessionId == thisSession && totalRead < MAX_READ
+                    while (listening && sessionId == thisSession
                             && (count = input.read(buffer)) != -1) {
                         totalRead += count;
                         int hexLength = Math.min(count, 256);
@@ -333,7 +350,14 @@ public final class MainActivity extends Activity {
             if (data.length - offset < fullLength) break;
             byte[] frame = Arrays.copyOfRange(data, offset, offset + fullLength);
             int channel = frame[0] & 0xff;
+            if ((frame[1] & 3) != 3) {
+                append("RX fragment: ch=" + channel + " flags=" + (frame[1] & 0xff)
+                        + " len=" + len + " (не интерпретирую как protobuf)");
+                offset += fullLength;
+                continue;
+            }
             int msgId = ((frame[4] & 0xff) << 8) | (frame[5] & 0xff);
+            byte[] payload = Arrays.copyOfRange(frame, 6, frame.length);
             if (scriptEnabled && script.isArmed()) {
                 script.onFrame(frame, new ProtocolScript.Transport() {
                     @Override public void log(String line) { append(line); }
@@ -359,12 +383,23 @@ public final class MainActivity extends Activity {
             } else if (channel == 0 && msgId == 4) {
                 if (authReplySent && Arrays.equals(frame, AUTH_RESPONSE)) {
                     authCompleteSeen = true;
+                    if (videoRequested && !discoveryRequestSent) sendServiceDiscovery();
                     append("AUTH_COMPLETE (ID 4, status=0) получен. Штатный AutoLink теперь отправляет SERVICE_DISCOVERY_REQUEST; можно нажать кнопку 5.");
                 } else {
                     append("Неожиданный ID 4: " + hex(frame, frame.length) + ". Кнопка 5 заблокирована.");
                 }
             } else if (channel == 0 && msgId == 6) {
-                append("SERVICE_DISCOVERY_RESPONSE получен (ID 6)! Скопируй полный RX и пришли мне, другие сообщения пока не отправляем.");
+                discoveryResponseSeen = true;
+                videoChannelId = AutoLinkVideoSession.findVideoChannel(payload);
+                append("SERVICE_DISCOVERY_RESPONSE: H.264 канал=" + videoChannelId
+                        + " (параметры теста 1280x720/30fps)");
+                if (videoRequested && videoChannelId > 0) videoSession.open(videoChannelId);
+            } else if (channel == 0 && msgId == 11 && authCompleteSeen) {
+                sendPingReply(payload);
+            } else if (channel > 0) {
+                videoSession.onRx(channel, msgId, payload);
+                append("RX VIDEO ch=" + channel + " id=0x"
+                        + Integer.toHexString(msgId) + " bytes=" + payload.length);
             } else {
                 append("Разобран кадр: канал=" + channel + ", флаги=" +
                         String.format(Locale.US, "0x%02X", frame[1] & 0xff)
@@ -377,6 +412,49 @@ public final class MainActivity extends Activity {
         if (incomingFrames.size() > MAX_READ) {
             append("Превышен лимит накопленных данных, сброс");
             incomingFrames.reset();
+        }
+    }
+
+    private void sendVideoPacket(byte[] packet) throws IOException {
+        synchronized (this) {
+            if (!listening || descriptor == null) throw new IOException("USB-сессия закрыта");
+            // Never close this FileOutputStream: RX shares the same PFD.
+            FileOutputStream output = new FileOutputStream(descriptor.getFileDescriptor());
+            output.write(packet);
+            output.flush();
+        }
+    }
+
+    private void sendPingReply(byte[] incomingPayload) {
+        if (!listening || descriptor == null || incomingPayload.length > 100) return;
+        byte[] packet = new byte[6 + incomingPayload.length];
+        packet[0] = 0; packet[1] = 3;
+        packet[2] = (byte) ((incomingPayload.length + 2) >>> 8);
+        packet[3] = (byte) (incomingPayload.length + 2);
+        packet[4] = 0; packet[5] = 12;
+        System.arraycopy(incomingPayload, 0, packet, 6, incomingPayload.length);
+        try {
+            sendVideoPacket(packet);
+            append("PING_RESPONSE ID12 отправлен, payload=" + hex(incomingPayload, incomingPayload.length));
+        } catch (IOException e) {
+            append("PING_RESPONSE ошибка: " + e.getMessage());
+        }
+    }
+
+    private void startVideoTest() {
+        videoRequested = true;
+        script.stop();
+        scriptEnabled = false;
+        autoHandshake = true;
+        append("VIDEO: тест разрешён. Авто VERSION/AUTH/SDP, затем CHANNEL_OPEN/SETUP/FOCUS и H.264.");
+        if (discoveryResponseSeen && videoChannelId > 0) {
+            videoSession.open(videoChannelId);
+        } else if (authCompleteSeen && !discoveryRequestSent) {
+            sendServiceDiscovery();
+        } else if (!listening) {
+            start();
+        } else if (totalRead > 0 && !authCompleteSeen) {
+            append("VIDEO: если рукопожатие уже прошло без сценария, переподключи USB.");
         }
     }
 
@@ -639,6 +717,7 @@ public final class MainActivity extends Activity {
     }
 
     private synchronized void stopReading() {
+        videoSession.stop();
         sessionId++;
         listening = false;
         closeDescriptor();
