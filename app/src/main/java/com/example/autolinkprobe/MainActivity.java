@@ -311,7 +311,8 @@ public final class MainActivity extends Activity {
             Intent permissionRequest = new Intent(USB_PERMISSION).setPackage(getPackageName());
             PendingIntent callback = PendingIntent.getBroadcast(
                     this, 0, permissionRequest,
-                    PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_MUTABLE);
+                    PendingIntent.FLAG_UPDATE_CURRENT |
+                    (Build.VERSION.SDK_INT >= 31 ? PendingIntent.FLAG_MUTABLE : 0));
             append("Запрошено системное разрешение на USB");
             usb.requestPermission(selected, callback);
         } else {
