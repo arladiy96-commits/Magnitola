@@ -8,7 +8,7 @@ import android.os.Handler;
 import android.os.Looper;
 import org.json.JSONArray;
 import org.json.JSONObject;
-import org.osmdroid.util.GeoPoint;
+import org.maplibre.android.geometry.LatLng;
 import java.io.BufferedReader;
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -32,10 +32,10 @@ final class RoutePlanner {
     }
 
     static final class Maneuver {
-        final GeoPoint point;
+        final LatLng point;
         final String instruction;
         int pathIndex;
-        Maneuver(GeoPoint p, String text) {
+        Maneuver(LatLng p, String text) {
             point = p;
             instruction = text;
         }
@@ -43,12 +43,12 @@ final class RoutePlanner {
 
     static final class Route {
         final String target;
-        final GeoPoint destination;
-        final ArrayList<GeoPoint> geometry;
+        final LatLng destination;
+        final ArrayList<LatLng> geometry;
         final ArrayList<Maneuver> maneuvers;
         final double distanceMeters, durationSeconds;
 
-        Route(String target, GeoPoint destination, ArrayList<GeoPoint> geometry,
+        Route(String target, LatLng destination, ArrayList<LatLng> geometry,
               ArrayList<Maneuver> maneuvers, double distanceMeters, double durationSeconds) {
             this.target = target;
             this.destination = destination;
@@ -94,7 +94,7 @@ final class RoutePlanner {
         final Context appContext = context.getApplicationContext();
         new Thread(() -> {
             try {
-                GeoPoint goal = resolve(appContext, destinationText);
+                LatLng goal = resolve(appContext, destinationText);
                 if (goal == null) {
                     fail(callback, "Адрес не найден. Попробуй точнее или введи широту, долготу.");
                     return;
@@ -108,7 +108,7 @@ final class RoutePlanner {
         }, "navigator-route-request").start();
     }
 
-    private static GeoPoint resolve(Context context, String text) throws Exception {
+    private static LatLng resolve(Context context, String text) throws Exception {
         // Also works when the Android system has no geocoding backend.
         String[] components = text.split("[,;]");
         if (components.length == 2) {
@@ -116,7 +116,7 @@ final class RoutePlanner {
                 double lat = Double.parseDouble(components[0].trim().replace(' ', '.'));
                 double lon = Double.parseDouble(components[1].trim().replace(' ', '.'));
                 if (lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180) {
-                    return new GeoPoint(lat, lon);
+                    return new LatLng(lat, lon);
                 }
             } catch (NumberFormatException ignored) { }
         }
@@ -129,10 +129,10 @@ final class RoutePlanner {
         if (results == null || results.isEmpty()) return null;
         Address address = results.get(0);
         if (!address.hasLatitude() || !address.hasLongitude()) return null;
-        return new GeoPoint(address.getLatitude(), address.getLongitude());
+        return new LatLng(address.getLatitude(), address.getLongitude());
     }
 
-    private static Route fetchRoute(String target, Location origin, GeoPoint goal) throws Exception {
+    private static Route fetchRoute(String target, Location origin, LatLng goal) throws Exception {
         String coords = String.format(Locale.US, "%.6f,%.6f;%.6f,%.6f",
                 origin.getLongitude(), origin.getLatitude(), goal.getLongitude(), goal.getLatitude());
         String url = "https://router.project-osrm.org/route/v1/driving/" + coords
@@ -173,10 +173,10 @@ final class RoutePlanner {
             if (routes.length() == 0) throw new IllegalStateException("нет автомобильного маршрута");
             JSONObject best = routes.getJSONObject(0);
             JSONArray coordsArray = best.getJSONObject("geometry").getJSONArray("coordinates");
-            ArrayList<GeoPoint> path = new ArrayList<>();
+            ArrayList<LatLng> path = new ArrayList<>();
             for (int i = 0; i < coordsArray.length(); i++) {
                 JSONArray pos = coordsArray.getJSONArray(i);
-                path.add(new GeoPoint(pos.getDouble(1), pos.getDouble(0)));
+                path.add(new LatLng(pos.getDouble(1), pos.getDouble(0)));
             }
             if (path.size() < 2) throw new IllegalStateException("маршрут не содержит дороги");
             ArrayList<Maneuver> maneuvers = new ArrayList<>();
@@ -192,7 +192,7 @@ final class RoutePlanner {
                     String road = step.optString("name");
                     if ("depart".equals(type)) continue;
                     String instruction = translate(type, modifier, road);
-                    maneuvers.add(new Maneuver(new GeoPoint(pos.getDouble(1), pos.getDouble(0)), instruction));
+                    maneuvers.add(new Maneuver(new LatLng(pos.getDouble(1), pos.getDouble(0)), instruction));
                 }
             }
             return new Route(target, goal, path, maneuvers,
@@ -220,7 +220,7 @@ final class RoutePlanner {
         return base;
     }
 
-    static float meters(GeoPoint a, GeoPoint b) {
+    static float meters(LatLng a, LatLng b) {
         float[] result = new float[1];
         Location.distanceBetween(a.getLatitude(), a.getLongitude(),
                 b.getLatitude(), b.getLongitude(), result);
