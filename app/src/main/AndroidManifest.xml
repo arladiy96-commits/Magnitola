@@ -6,7 +6,7 @@
     <uses-feature android:name="android.hardware.location.gps" android:required="false" />
     <uses-feature android:name="android.hardware.usb.accessory" android:required="false" />
     <application
-        android:label="GAZ Спидометр"
+        android:label="@string/app_name"
         android:allowBackup="false"
         android:theme="@android:style/Theme.Material.NoActionBar"
         android:usesCleartextTraffic="false">
