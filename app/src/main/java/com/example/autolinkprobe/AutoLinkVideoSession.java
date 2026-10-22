@@ -46,6 +46,14 @@ final class AutoLinkVideoSession {
         return screen == null ? null : screen.latestLocation();
     }
 
+    /** Diagnostic only. The video transport and PRIVATE display flags stay unchanged. */
+    synchronized int navigationDisplayId() {
+        if (!navigationMode || !streaming || navigationDisplay == null
+                || navigationDisplay.getDisplay() == null) return -1;
+        return navigationDisplay.getDisplay().getDisplayId();
+    }
+
+
     synchronized boolean setNavigationMode(boolean enabled) {
         if (streaming || channel > 0) return false;
         navigationMode = enabled;
