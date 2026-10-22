@@ -62,6 +62,7 @@ public final class MainActivity extends Activity {
     private volatile boolean discoveryResponseSeen;
     private volatile boolean videoRequested;
     private volatile int videoChannelId = -1;
+    private boolean videoFlag0B = true;
     private final AutoLinkVideoSession videoSession = new AutoLinkVideoSession(
             new AutoLinkVideoSession.Sink() {
                 @Override public void send(byte[] packet) throws IOException { sendVideoPacket(packet); }
@@ -126,10 +127,21 @@ public final class MainActivity extends Activity {
         addButton(root, "4. Ответить AUTH_RESPONSE (status=0)", this::respondAuth);
         addButton(root, "5. Запросить сервисы магнитолы (SERVICE_DISCOVERY)", this::sendServiceDiscovery);
         addButton(root, "6. Передать H.264 тест-картинку на магнитолу", this::startVideoTest);
+        addButton(root, "Режим видеопакетов: переключить 0x0B / 0x03", () -> {
+            if (listening && discoveryResponseSeen) {
+                append("VIDEO: переключение режима только до новой USB-сессии. Отключи кабель.");
+                return;
+            }
+            videoFlag0B = !videoFlag0B;
+            videoSession.setMirrorPeerFlag(videoFlag0B);
+            append("VIDEO: режим после AUTH = " + (videoFlag0B
+                    ? "0x0B (зеркалим флаг магнитолы, НЕ TLS-шифрование)"
+                    : "0x03 (обычный plaintext)") + ". Переподключи USB для нового теста.");
+        });
         addButton(root, "Остановить тестовое видео", () -> {
             videoRequested = false;
             videoSession.stop();
-            append("VIDEO: тест остановлен вручную.");
+            append("VIDEO: тест остановлен вручную; USB-сессия остаётся открытой.");
         });
         addButton(root, "Остановить чтение", this::stopReading);
         addButton(root, "Сохранить лог в файл", this::exportLog);
@@ -292,6 +304,11 @@ public final class MainActivity extends Activity {
                     synchronized (MainActivity.this) {
                         if (sessionId == thisSession) {
                             listening = false;
+                            videoSession.stop();
+                            discoveryResponseSeen = false;
+                            videoChannelId = -1;
+                            authCompleteSeen = false;
+                            discoveryRequestSent = false;
                             append("Чтение завершено; принято " + totalRead + " байт");
                             closeDescriptor();
                         } else {
@@ -396,6 +413,10 @@ public final class MainActivity extends Activity {
                 if (videoRequested && videoChannelId > 0) videoSession.open(videoChannelId);
             } else if (channel == 0 && msgId == 11 && authCompleteSeen) {
                 sendPingReply(payload);
+            } else if (channel == 0 && msgId == 0xFF05) {
+                append("ВНИМАНИЕ: магнитола вернула ID=0xFF05 сразу после видеокоманды. "
+                        + "Это НЕ SETUP_RESPONSE (ожидался 0x8003); назначение FF05 пока неизвестно. "
+                        + "Последнее состояние: " + videoSession.state());
             } else if (channel > 0) {
                 videoSession.onRx(channel, msgId, payload);
                 append("RX VIDEO ch=" + channel + " id=0x"
@@ -447,14 +468,21 @@ public final class MainActivity extends Activity {
         scriptEnabled = false;
         autoHandshake = true;
         append("VIDEO: тест разрешён. Авто VERSION/AUTH/SDP, затем CHANNEL_OPEN/SETUP/FOCUS и H.264.");
-        if (discoveryResponseSeen && videoChannelId > 0) {
+        videoSession.setMirrorPeerFlag(videoFlag0B);
+        if (!listening || descriptor == null) {
+            append("VIDEO: USB не подключён; жду новое подключение.");
+            start();
+        } else if (discoveryResponseSeen && videoChannelId > 0) {
+            append("VIDEO: " + videoSession.state() + "; повторное нажатие не отправляет дублирующие команды.");
             videoSession.open(videoChannelId);
         } else if (authCompleteSeen && !discoveryRequestSent) {
             sendServiceDiscovery();
-        } else if (!listening) {
-            start();
+        } else if (encapsulatedSslSeen && !authReplySent) {
+            respondAuth();
+        } else if (versionRequestSeen && !versionReplySent) {
+            respondVersion();
         } else if (totalRead > 0 && !authCompleteSeen) {
-            append("VIDEO: если рукопожатие уже прошло без сценария, переподключи USB.");
+            append("VIDEO: текущая USB-сессия уже в процессе обмена. Если нет реакции, переподключи кабель.");
         }
     }
 
@@ -718,6 +746,10 @@ public final class MainActivity extends Activity {
 
     private synchronized void stopReading() {
         videoSession.stop();
+        discoveryResponseSeen = false;
+        videoChannelId = -1;
+        authCompleteSeen = false;
+        discoveryRequestSent = false;
         sessionId++;
         listening = false;
         closeDescriptor();
