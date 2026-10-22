@@ -24,6 +24,8 @@ import org.osmdroid.tileprovider.tilesource.TileSourceFactory;
 import org.osmdroid.util.GeoPoint;
 import org.osmdroid.views.MapView;
 import org.osmdroid.views.overlay.Marker;
+import org.osmdroid.views.overlay.Polyline;
+import java.util.Locale;
 
 /**
  * Own navigation canvas for AutoLink's PRIVATE virtual display.
@@ -34,6 +36,13 @@ final class NavigatorPresentation extends Presentation {
     private MapView map;
     private Marker position;
     private TextView gpsState;
+    private TextView nextTurn;
+    private Polyline routeLine;
+    private Marker routeDestinationMarker;
+    private RoutePlanner.Route activeRoute;
+    private volatile Location lastFix;
+    private double[] metersToFinish;
+    private int lastRouteVertex;
     private LocationManager locationManager;
     private LocationListener locationListener;
 
@@ -69,13 +78,19 @@ final class NavigatorPresentation extends Presentation {
         gpsState.setText("Ожидаю GPS...  •  Маршруты пока не реализованы");
         gpsState.setTextColor(0xFFB9DDEA);
         gpsState.setTextSize(16);
+        nextTurn = new TextView(getContext());
+        nextTurn.setText("Карта готова. Введи пункт назначения на телефоне.");
+        nextTurn.setTextColor(0xFFFAE2A5);
+        nextTurn.setTextSize(22);
+        nextTurn.setPadding(0, 4, 0, 0);
         header.addView(title);
         header.addView(gpsState);
+        header.addView(nextTurn);
         root.addView(header, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP));
 
         TextView attribution = new TextView(getContext());
-        attribution.setText("© OpenStreetMap contributors");
+        attribution.setText("© OpenStreetMap contributors • маршруты: OSRM demo");
         attribution.setBackgroundColor(0xB8000000);
         attribution.setPadding(10, 5, 10, 5);
         attribution.setTextSize(12);
@@ -102,7 +117,8 @@ final class NavigatorPresentation extends Presentation {
         if (locationManager == null) return;
         locationListener = new LocationListener() {
             @Override public void onLocationChanged(Location location) {
-                if (map == null || !location.hasAccuracy() && location.getLatitude() == 0) return;
+                if (map == null) return;
+                lastFix = new Location(location);
                 GeoPoint point = new GeoPoint(location.getLatitude(), location.getLongitude());
                 if (position == null) {
                     position = new Marker(map);
@@ -113,9 +129,10 @@ final class NavigatorPresentation extends Presentation {
                 position.setPosition(point);
                 map.getController().setCenter(point);
                 map.invalidate();
-                gpsState.setText(String.format(java.util.Locale.US,
+                gpsState.setText(String.format(Locale.US,
                         "GPS • %.1f км/ч • точность %.0f м", Math.max(0, location.getSpeed() * 3.6f),
                         location.hasAccuracy() ? location.getAccuracy() : 0));
+                updateRouteProgress(location);
             }
         };
         try {
@@ -136,12 +153,109 @@ final class NavigatorPresentation extends Presentation {
         }
     }
 
+    Location latestLocation() {
+        Location fix = lastFix;
+        return fix == null ? null : new Location(fix);
+    }
+
+    /** Always invoked on the main thread (Presentation/MapView requirement). */
+    void setRoute(RoutePlanner.Route route) {
+        if (map == null || route == null) return;
+        if (routeLine != null) map.getOverlays().remove(routeLine);
+        if (routeDestinationMarker != null) map.getOverlays().remove(routeDestinationMarker);
+        activeRoute = route;
+        lastRouteVertex = 0;
+        routeLine = new Polyline(map);
+        routeLine.setPoints(route.geometry);
+        routeLine.setColor(0xFF0878EE);
+        routeLine.setWidth(10f);
+        map.getOverlays().add(routeLine);
+
+        routeDestinationMarker = new Marker(map);
+        routeDestinationMarker.setTitle(route.target);
+        routeDestinationMarker.setPosition(route.destination);
+        routeDestinationMarker.setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM);
+        map.getOverlays().add(routeDestinationMarker);
+
+        // Precompute remaining road distance for each polyline vertex once,
+        // rather than walking the whole route on every GPS update.
+        metersToFinish = new double[route.geometry.size()];
+        metersToFinish[metersToFinish.length - 1] = 0;
+        for (int i = metersToFinish.length - 2; i >= 0; i--) {
+            metersToFinish[i] = metersToFinish[i + 1] +
+                    RoutePlanner.meters(route.geometry.get(i), route.geometry.get(i + 1));
+        }
+        nextTurn.setText(String.format(Locale.US, "Маршрут: %.1f км • ~%.0f мин",
+                route.distanceMeters / 1000.0, route.durationSeconds / 60.0));
+        if (lastFix != null) updateRouteProgress(lastFix);
+        map.invalidate();
+    }
+
+    /** GPS stays on the PRIVATE screen; never intercepts touch on the phone. */
+    private void updateRouteProgress(Location fix) {
+        RoutePlanner.Route route = activeRoute;
+        if (route == null || route.geometry.size() < 2 || nextTurn == null) return;
+        // Find the nearest road vertex; constrain search to nearby points when moving.
+        // Fall back to the full route only if we are far away (reconnected GPS).
+        int best = lastRouteVertex;
+        double nearest = Double.POSITIVE_INFINITY;
+        int from = Math.max(0, lastRouteVertex - 30);
+        int to = Math.min(route.geometry.size(), lastRouteVertex + 451);
+        for (int i = from; i < to; i++) {
+            double d = quickMeters(fix.getLatitude(), fix.getLongitude(), route.geometry.get(i));
+            if (d < nearest) { nearest = d; best = i; }
+        }
+        if (nearest > 180.0) {
+            nearest = Double.POSITIVE_INFINITY;
+            for (int i = 0; i < route.geometry.size(); i++) {
+                double d = quickMeters(fix.getLatitude(), fix.getLongitude(), route.geometry.get(i));
+                if (d < nearest) { nearest = d; best = i; }
+            }
+        }
+        lastRouteVertex = Math.max(0, best);
+        if (nearest > Math.max(100.0, fix.hasAccuracy() ? 2 * fix.getAccuracy() : 100.0)) {
+            nextTurn.setText("Вне маршрута • перестрой маршрут на телефоне");
+            return;
+        }
+        double remainingMeters = metersToFinish[best];
+        if (remainingMeters < 35) {
+            nextTurn.setText("Вы прибыли в пункт назначения");
+            return;
+        }
+        String next = "Двигайтесь по маршруту";
+        double beforeTurn = remainingMeters;
+        for (RoutePlanner.Maneuver maneuver : route.maneuvers) {
+            if (maneuver.pathIndex >= best + 1) {
+                next = maneuver.instruction;
+                beforeTurn = Math.max(0, remainingMeters - metersToFinish[maneuver.pathIndex]);
+                break;
+            }
+        }
+        String distance = beforeTurn >= 1000
+                ? String.format(Locale.US, "%.1f км", beforeTurn / 1000.0)
+                : String.format(Locale.US, "%.0f м", beforeTurn);
+        nextTurn.setText(distance + " • " + next
+                + String.format(Locale.US, "\nДо финиша %.1f км", remainingMeters / 1000.0));
+    }
+
+    private static double quickMeters(double lat, double lon, GeoPoint road) {
+        double deltaLat = (lat - road.getLatitude()) * 111132.0;
+        double deltaLon = (lon - road.getLongitude()) * 111320.0 *
+                Math.cos(Math.toRadians(lat));
+        return Math.hypot(deltaLat, deltaLon);
+    }
+
     @Override protected void onStop() {
         if (locationManager != null && locationListener != null) {
             locationManager.removeUpdates(locationListener);
         }
         locationListener = null;
         locationManager = null;
+        lastFix = null;
+        activeRoute = null;
+        routeLine = null;
+        routeDestinationMarker = null;
+        metersToFinish = null;
         if (map != null) {
             map.onPause();
             map.onDetach();
