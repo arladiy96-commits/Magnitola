@@ -12,6 +12,9 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.hardware.usb.UsbAccessory;
 import android.hardware.usb.UsbManager;
+import android.location.Location;
+import android.location.LocationManager;
+import android.os.SystemClock;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.ParcelFileDescriptor;
@@ -76,6 +79,8 @@ public final class MainActivity extends Activity {
     private final ByteArrayOutputStream incomingFrames = new ByteArrayOutputStream();
     private TextView logView;
     private EditText scriptEditor;
+    private EditText destinationInput;
+    private volatile boolean routeRequestActive;
     private final ProtocolScript script = new ProtocolScript();
     private volatile boolean scriptEnabled;
     private final StringBuilder log = new StringBuilder();
@@ -139,6 +144,17 @@ public final class MainActivity extends Activity {
             startVideoTest();
         });
         addButton(root, "7. Независимая карта OSM + GPS на магнитоле", this::startNavigationTest);
+        root.addView(label("Куда едем? Введи адрес или координаты широта, долгота:"));
+        destinationInput = new EditText(this);
+        destinationInput.setSingleLine(true);
+        destinationInput.setTextSize(17);
+        destinationInput.setHint("Петропавловск, улица ...");
+        destinationInput.setText(getPreferences(MODE_PRIVATE).getString("nav_destination", ""));
+        root.addView(destinationInput);
+        addButton(root, "8. Построить маршрут на магнитоле", this::buildNavigationRoute);
+        root.addView(label("Тестовый маршрут: адрес ищет служба Android, координаты поездки "
+                + "передаются демосерверу OSRM. Нет пробок, голоса и автоперестроения. "
+                + "Вводи адрес, только когда машина стоит."));
         addButton(root, "Режим видеопакетов: переключить 0x0B / 0x03", () -> {
             if (listening && discoveryResponseSeen) {
                 append("VIDEO: переключение режима только до новой USB-сессии. Отключи кабель.");
@@ -485,6 +501,62 @@ public final class MainActivity extends Activity {
         } catch (IOException e) {
             append("PING_RESPONSE ошибка: " + e.getMessage());
         }
+    }
+
+    private void buildNavigationRoute() {
+        if (!videoSession.isStreaming()) {
+            append("NAV: сначала запусти кнопку 7 и дождись карты на магнитоле.");
+            return;
+        }
+        if (routeRequestActive) {
+            append("NAV: предыдущий запрос маршрута ещё выполняется.");
+            return;
+        }
+        String destination = destinationInput.getText().toString().trim();
+        if (destination.length() < 3) {
+            append("NAV: укажи адрес назначения.");
+            return;
+        }
+        getPreferences(MODE_PRIVATE).edit().putString("nav_destination", destination).apply();
+        Location origin = videoSession.currentLocation();
+        if (origin == null) {
+            try {
+                LocationManager location = (LocationManager) getSystemService(LOCATION_SERVICE);
+                if (location != null && (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION)
+                        == PackageManager.PERMISSION_GRANTED || checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION)
+                        == PackageManager.PERMISSION_GRANTED)) {
+                    Location a = location.getLastKnownLocation(LocationManager.GPS_PROVIDER);
+                    Location b = location.getLastKnownLocation(LocationManager.NETWORK_PROVIDER);
+                    origin = a == null ? b : b == null ? a
+                            : a.getTime() >= b.getTime() ? a : b;
+                }
+            } catch (SecurityException ignored) { }
+        }
+        if (origin == null || Math.abs(System.currentTimeMillis() - origin.getTime()) > 300000) {
+            append("NAV: нет свежего GPS (до 5 минут). Дождись обновления координат.");
+            return;
+        }
+        routeRequestActive = true;
+        append("NAV: ищу адрес и строю маршрут; запрос только по нажатию кнопки.");
+        RoutePlanner.build(this, destination, origin, new RoutePlanner.Callback() {
+            @Override public void onReady(RoutePlanner.Route route) {
+                routeRequestActive = false;
+                if (!videoSession.isStreaming()) {
+                    append("NAV: маршрут найден, но видео уже остановлено.");
+                    return;
+                }
+                videoSession.setRoute(route);
+                append(String.format(Locale.US,
+                        "NAV: маршрут ПОСТРОЕН: %s, %.1f км, ~%.0f мин; "
+                                + "линия и ближайший поворот выводятся на магнитолу.",
+                        route.target, route.distanceMeters / 1000, route.durationSeconds / 60));
+            }
+            @Override public void onError(String message) {
+                routeRequestActive = false;
+                append("NAV: " + message);
+                Toast.makeText(MainActivity.this, message, Toast.LENGTH_LONG).show();
+            }
+        });
     }
 
     private void startNavigationTest() {
