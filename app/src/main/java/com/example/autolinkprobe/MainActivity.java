@@ -1,6 +1,11 @@
 package com.example.autolinkprobe;
 
+import android.Manifest;
+import android.content.pm.PackageManager;
 import android.app.Activity;
+import android.app.ActivityManager;
+import android.app.ActivityOptions;
+import android.content.ActivityNotFoundException;
 import android.app.PendingIntent;
 import android.content.BroadcastReceiver;
 import android.content.ClipData;
@@ -10,6 +15,9 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.hardware.usb.UsbAccessory;
 import android.hardware.usb.UsbManager;
+import android.location.Location;
+import android.location.LocationManager;
+import android.os.SystemClock;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.ParcelFileDescriptor;
@@ -42,6 +50,9 @@ import java.util.Locale;
 public final class MainActivity extends Activity {
     private static final String USB_PERMISSION = "com.example.autolinkprobe.USB_PERMISSION";
     private static final int CREATE_LOG = 100;
+    private static final int REQUEST_NAV_LOCATION = 101;
+    private boolean navigationAwaitingPermission;
+    private boolean logUpdatePosted;
     private static final int MAX_READ = 65536;
     private static final int MAX_LOG_CHARS = 160000;
 
@@ -63,7 +74,7 @@ public final class MainActivity extends Activity {
     private volatile boolean videoRequested;
     private volatile int videoChannelId = -1;
     private boolean videoFlag0B = true;
-    private final AutoLinkVideoSession videoSession = new AutoLinkVideoSession(
+    private final AutoLinkVideoSession videoSession = new AutoLinkVideoSession(this,
             new AutoLinkVideoSession.Sink() {
                 @Override public void send(byte[] packet) throws IOException { sendVideoPacket(packet); }
                 @Override public void log(String line) { append(line); }
@@ -71,6 +82,9 @@ public final class MainActivity extends Activity {
     private final ByteArrayOutputStream incomingFrames = new ByteArrayOutputStream();
     private TextView logView;
     private EditText scriptEditor;
+    private EditText destinationInput;
+    private TextView gisTestStatus;
+    private volatile boolean routeRequestActive;
     private final ProtocolScript script = new ProtocolScript();
     private volatile boolean scriptEnabled;
     private final StringBuilder log = new StringBuilder();
@@ -126,7 +140,29 @@ public final class MainActivity extends Activity {
         addButton(root, "3. Ответить VERSION_RESPONSE 1.11 (один раз)", this::respondVersion);
         addButton(root, "4. Ответить AUTH_RESPONSE (status=0)", this::respondAuth);
         addButton(root, "5. Запросить сервисы магнитолы (SERVICE_DISCOVERY)", this::sendServiceDiscovery);
-        addButton(root, "6. Передать H.264 тест-картинку на магнитолу", this::startVideoTest);
+        addButton(root, "6. Передать H.264 тест-картинку на магнитолу", () -> {
+            if (!videoSession.setNavigationMode(false)) {
+                append("VIDEO: останови текущую сессию перед сменой режима.");
+                return;
+            }
+            startVideoTest();
+        });
+        addButton(root, "7. Независимая карта OSM + GPS на магнитоле", this::startNavigationTest);
+        root.addView(label("Куда едем? Введи адрес или координаты широта, долгота:"));
+        destinationInput = new EditText(this);
+        destinationInput.setSingleLine(true);
+        destinationInput.setTextSize(17);
+        destinationInput.setHint("Петропавловск, улица ...");
+        destinationInput.setText(getPreferences(MODE_PRIVATE).getString("nav_destination", ""));
+        root.addView(destinationInput);
+        addButton(root, "8. Построить маршрут на магнитоле", this::buildNavigationRoute);
+        addButton(root, "9. ТЕСТ: открыть настоящий 2ГИС на магнитоле", this::testLaunch2GisOnDisplay);
+        gisTestStatus = label("2ГИС: тест ещё не запускали.");
+        gisTestStatus.setTextSize(14);
+        root.addView(gisTestStatus);
+        root.addView(label("Тестовый маршрут: адрес ищет служба Android, координаты поездки "
+                + "передаются демосерверу OSRM. Нет пробок, голоса и автоперестроения. "
+                + "Вводи адрес, только когда машина стоит."));
         addButton(root, "Режим видеопакетов: переключить 0x0B / 0x03", () -> {
             if (listening && discoveryResponseSeen) {
                 append("VIDEO: переключение режима только до новой USB-сессии. Отключи кабель.");
@@ -194,16 +230,24 @@ public final class MainActivity extends Activity {
     private void append(String message) {
         String line = new SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
                 .format(new Date()) + " " + message + "\n";
-        final String snapshot;
+        boolean schedule;
         synchronized (log) {
-            if (log.length() < MAX_LOG_CHARS) {
-                log.append(line);
-            }
-            snapshot = log.toString();
+            if (log.length() < MAX_LOG_CHARS) log.append(line);
+            schedule = !logUpdatePosted;
+            if (schedule) logUpdatePosted = true;
         }
-        runOnUiThread(() -> {
-            if (logView != null) logView.setText(snapshot);
-        });
+        // RX runs up to 30+ times a second. NEVER copy and redraw the whole
+        // diagnostic log for every video ACK: it freezes the phone's main UI.
+        if (schedule) mainHandler.postDelayed(() -> {
+            String tail;
+            synchronized (log) {
+                logUpdatePosted = false;
+                int length = log.length();
+                tail = (length > 9000 ? "... [в окне показаны последние 9000 символов]\n" : "")
+                        + log.substring(Math.max(0, length - 9000), length);
+            }
+            if (logView != null) logView.setText(tail);
+        }, 350);
     }
 
     private void scan() {
@@ -289,7 +333,13 @@ public final class MainActivity extends Activity {
                             && (count = input.read(buffer)) != -1) {
                         totalRead += count;
                         int hexLength = Math.min(count, 256);
-                        append("RX " + count + " байт: " + hex(buffer, hexLength)
+                        // Frequent native ACKs are still parsed for flow control,
+                        // but not hex-dumped 30 times per second into TextView.
+                        boolean videoAck = count == 10
+                                && (buffer[0] & 0xff) == 1
+                                && (buffer[4] & 0xff) == 0
+                                && (buffer[5] & 0xff) == 6;
+                        if (!videoAck) append("RX " + count + " байт: " + hex(buffer, hexLength)
                                 + (count > hexLength ? " [остальное опущено]" : ""));
                         try {
                             processIncomingFrames(buffer, count);
@@ -408,8 +458,7 @@ public final class MainActivity extends Activity {
             } else if (channel == 0 && msgId == 6) {
                 discoveryResponseSeen = true;
                 videoChannelId = AutoLinkVideoSession.findVideoChannel(payload);
-                append("SERVICE_DISCOVERY_RESPONSE: H.264 канал=" + videoChannelId
-                        + " (параметры теста 1280x720/30fps)");
+                append("SERVICE_DISCOVERY_RESPONSE: H.264 канал=" + videoChannelId);
                 if (videoRequested && videoChannelId > 0) videoSession.open(videoChannelId);
             } else if (channel == 0 && msgId == 11 && authCompleteSeen) {
                 sendPingReply(payload);
@@ -419,7 +468,7 @@ public final class MainActivity extends Activity {
                         + "Последнее состояние: " + videoSession.state());
             } else if (channel > 0) {
                 videoSession.onRx(channel, msgId, payload);
-                append("RX VIDEO ch=" + channel + " id=0x"
+                if (msgId != 6) append("RX VIDEO ch=" + channel + " id=0x"
                         + Integer.toHexString(msgId) + " bytes=" + payload.length);
             } else {
                 append("Разобран кадр: канал=" + channel + ", флаги=" +
@@ -459,6 +508,163 @@ public final class MainActivity extends Activity {
             append("PING_RESPONSE ID12 отправлен, payload=" + hex(incomingPayload, incomingPayload.length));
         } catch (IOException e) {
             append("PING_RESPONSE ошибка: " + e.getMessage());
+        }
+    }
+
+    private void buildNavigationRoute() {
+        if (!videoSession.isStreaming()) {
+            append("NAV: сначала запусти кнопку 7 и дождись карты на магнитоле.");
+            return;
+        }
+        if (routeRequestActive) {
+            append("NAV: предыдущий запрос маршрута ещё выполняется.");
+            return;
+        }
+        String destination = destinationInput.getText().toString().trim();
+        if (destination.length() < 3) {
+            append("NAV: укажи адрес назначения.");
+            return;
+        }
+        getPreferences(MODE_PRIVATE).edit().putString("nav_destination", destination).apply();
+        Location origin = videoSession.currentLocation();
+        if (origin == null) {
+            try {
+                LocationManager location = (LocationManager) getSystemService(LOCATION_SERVICE);
+                if (location != null && (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION)
+                        == PackageManager.PERMISSION_GRANTED || checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION)
+                        == PackageManager.PERMISSION_GRANTED)) {
+                    Location a = location.getLastKnownLocation(LocationManager.GPS_PROVIDER);
+                    Location b = location.getLastKnownLocation(LocationManager.NETWORK_PROVIDER);
+                    origin = a == null ? b : b == null ? a
+                            : a.getTime() >= b.getTime() ? a : b;
+                }
+            } catch (SecurityException ignored) { }
+        }
+        if (origin == null || Math.abs(System.currentTimeMillis() - origin.getTime()) > 300000) {
+            append("NAV: нет свежего GPS (до 5 минут). Дождись обновления координат.");
+            return;
+        }
+        routeRequestActive = true;
+        append("NAV: ищу адрес и строю маршрут; запрос только по нажатию кнопки.");
+        RoutePlanner.build(this, destination, origin, new RoutePlanner.Callback() {
+            @Override public void onReady(RoutePlanner.Route route) {
+                routeRequestActive = false;
+                if (!videoSession.isStreaming()) {
+                    append("NAV: маршрут найден, но видео уже остановлено.");
+                    return;
+                }
+                videoSession.setRoute(route);
+                append(String.format(Locale.US,
+                        "NAV: маршрут ПОСТРОЕН: %s, %.1f км, ~%.0f мин; "
+                                + "линия и ближайший поворот выводятся на магнитолу.",
+                        route.target, route.distanceMeters / 1000, route.durationSeconds / 60));
+            }
+            @Override public void onError(String message) {
+                routeRequestActive = false;
+                append("NAV: " + message);
+                Toast.makeText(MainActivity.this, message, Toast.LENGTH_LONG).show();
+            }
+        });
+    }
+
+    /**
+     * Diagnostic only. Ask Android whether a *third-party* Activity may appear
+     * on the existing private encoder-backed display. Never launch on the phone
+     * as fallback: that would spoil this test and steal the user's screen.
+     */
+    private void testLaunch2GisOnDisplay() {
+        final String packageName = "ru.dublgis.dgismobile";
+        int displayId = videoSession.navigationDisplayId();
+        boolean multiDisplay = getPackageManager().hasSystemFeature(
+                PackageManager.FEATURE_ACTIVITIES_ON_SECONDARY_DISPLAYS);
+        append("2GIS TEST: Android=" + Build.VERSION.SDK_INT
+                + " supportsSecondaryActivities=" + multiDisplay
+                + " privateVirtualDisplayId=" + displayId);
+        if (displayId < 0) {
+            reportGisTest("Сначала нажми 7, подключи USB и дождись карты на магнитоле. "
+                    + "Повторно USB-подключать для этого теста не нужно.");
+            return;
+        }
+        if (!multiDisplay) {
+            reportGisTest("Android не объявляет поддержку запуска Activities на втором дисплее. "
+                    + "2ГИС на телефоне не открываю.");
+            return;
+        }
+        Intent launch = getPackageManager().getLaunchIntentForPackage(packageName);
+        if (launch == null) {
+            reportGisTest("Пакет ru.dublgis.dgismobile не найден или у него нет открываемой Activity. "
+                    + "Убедись, что обычный 2ГИС установлен на телефоне.");
+            return;
+        }
+        launch.setPackage(packageName);
+        // Force a fresh task on the secondary display instead of moving the
+        // user's already-running 2GIS task away from the primary phone display.
+        launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_MULTIPLE_TASK);
+        try {
+            ActivityManager manager = (ActivityManager) getSystemService(ACTIVITY_SERVICE);
+            boolean allowed = manager != null &&
+                    manager.isActivityStartAllowedOnDisplay(this, displayId, launch);
+            append("2GIS TEST: isActivityStartAllowedOnDisplay(" + displayId + ")=" + allowed);
+            if (!allowed) {
+                reportGisTest("Android запретил запуск чужого приложения на нашем виртуальном "
+                        + "дисплее (isActivityStartAllowedOnDisplay=false). Это системная "
+                        + "защита, а не ошибка AutoLink или карты.");
+                return;
+            }
+            ActivityOptions options = ActivityOptions.makeBasic();
+            options.setLaunchDisplayId(displayId);
+            startActivity(launch, options.toBundle());
+            reportGisTest("Команда запуска 2ГИС отправлена на экран #" + displayId
+                    + ". Посмотри, появился ли 2ГИС на Газели. "
+                    + "Сама команда ещё не доказывает, что окно открылось.");
+        } catch (SecurityException error) {
+            reportGisTest("Android отклонил запуск 2ГИС: " + error.getClass().getSimpleName()
+                    + ": " + String.valueOf(error.getMessage()));
+        } catch (ActivityNotFoundException error) {
+            reportGisTest("Не найдена открываемая Activity 2ГИС: " + error.getMessage());
+        } catch (RuntimeException error) {
+            reportGisTest("Сбой запуска на втором дисплее: "
+                    + error.getClass().getSimpleName() + ": " + error.getMessage());
+        }
+    }
+
+    private void reportGisTest(String message) {
+        String line = "2GIS TEST: " + message;
+        append(line);
+        if (gisTestStatus != null) gisTestStatus.setText(line);
+        Toast.makeText(this, message, Toast.LENGTH_LONG).show();
+    }
+
+    private void startNavigationTest() {
+        if (!videoSession.setNavigationMode(true)) {
+            append("NAV: сначала останови текущую видеосессию кнопкой остановки.");
+            return;
+        }
+        if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION)
+                != PackageManager.PERMISSION_GRANTED
+                && checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION)
+                != PackageManager.PERMISSION_GRANTED) {
+            navigationAwaitingPermission = true;
+            append("NAV: запрашиваю GPS для карты; без разрешения карта откроется без геопозиции.");
+            requestPermissions(new String[]{Manifest.permission.ACCESS_FINE_LOCATION,
+                    Manifest.permission.ACCESS_COARSE_LOCATION}, REQUEST_NAV_LOCATION);
+            return;
+        }
+        append("NAV: запускаю НЕЗАВИСИМУЮ карту 1024x600@20fps; экран телефона свободен.");
+        startVideoTest();
+    }
+
+    @Override public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == REQUEST_NAV_LOCATION && navigationAwaitingPermission) {
+            navigationAwaitingPermission = false;
+            if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION)
+                    != PackageManager.PERMISSION_GRANTED
+                    && checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION)
+                    != PackageManager.PERMISSION_GRANTED) {
+                append("NAV: GPS запрещён; карта запустится без местоположения.");
+            }
+            startVideoTest();
         }
     }
 
