@@ -247,7 +247,8 @@ public final class MainActivity extends Activity {
     private void append(String message) {
         if (message.startsWith("NAV: векторная карта")) {
             setStatus("USB подключён. Проверяю загрузку дорог на магнитоле…");
-        } else if (message.startsWith("КАРТА МАГНИТОЛА:")) {
+        } else if (message.startsWith("КАРТА МАГНИТОЛА:")
+                || message.startsWith("КАРТА:")) {
             setStatus(message);
         } else if (message.startsWith("NAV: ошибка") ||
                 message.startsWith("VIDEO: MediaCodec ошибка")) {
