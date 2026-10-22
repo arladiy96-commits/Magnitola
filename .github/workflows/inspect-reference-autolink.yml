@@ -70,9 +70,36 @@ jobs:
           print('Found',len(selected),'relevant symbols, wrote',len(output),'lines.')
           PY
           python /tmp/disasm.py
+      - name: Inspect Java call sites (no code/binary retained)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if curl --fail --location --retry 2 --max-time 100 -o /tmp/jadx.zip \
+            'https://github.com/skylot/jadx/releases/download/v1.5.1/jadx-1.5.1.zip'; then
+            mkdir -p /tmp/jadx-dist /tmp/jadx-src
+            unzip -q /tmp/jadx.zip -d /tmp/jadx-dist
+            chmod +x /tmp/jadx-dist/bin/jadx
+            /tmp/jadx-dist/bin/jadx --threads-count 2 --no-res \
+              --output-dir /tmp/jadx-src /tmp/original-autolink.apk > /tmp/jadx.log 2>&1 || true
+            {
+              echo '=== Call sites sendStart/sendSetup/sendVideoFocus ==='
+              grep -R -n -E 'sendStart\\(|sendSetup\\(|sendVideoFocusRequestNotifi\\(' \
+                /tmp/jadx-src/sources/com/car/autolink/ 2>/dev/null | head -100 || true
+              echo '=== Java video protocol source file matches ==='
+              find /tmp/jadx-src/sources/com/car/autolink -iname '*VideoSource*' \
+                -o -iname '*VideoService*' 2>/dev/null | head -20
+              echo '=== Context of sendStart call ==='
+              grep -R -n -B 6 -A 6 -E '\\.sendStart\\(' \
+                /tmp/jadx-src/sources/com/car/autolink 2>/dev/null | head -180 || true
+            } > diagnostic/java-call-sites.txt
+            echo 'Java call site extraction complete'
+          else
+            echo 'jadx download failed, native symbolic analysis remains valid' \
+               > diagnostic/java-call-sites.txt
+          fi
       - name: Upload text-only diagnostic
         uses: actions/upload-artifact@v4
         with:
           name: reference-autolink-symbolic-protocol
-          path: diagnostic/symbolic-protocol-report.txt
+          path: diagnostic/*.txt
           retention-days: 2
