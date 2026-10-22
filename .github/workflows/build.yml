@@ -1,4 +1,4 @@
-name: Build USB Probe APK
+name: Build GAZ Speedometer POCO + Android 7 tablet
 
 on:
   workflow_dispatch:
@@ -38,11 +38,17 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.9"
-      - name: Compile debug APK
-        run: gradle --no-daemon :app:assembleDebug
-      - name: Upload debug APK
+      - name: Compile both APK variants
+        run: gradle --no-daemon :app:assemblePocoDebug :app:assembleTabletDebug
+      - name: Upload POCO APK
         uses: actions/upload-artifact@v4
         with:
-          name: AutoLinkUsbProbe-debug-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
+          name: GAZ-Speedometer-POCO-Android8plus
+          path: app/build/outputs/apk/poco/debug/app-poco-debug.apk
+          if-no-files-found: error
+      - name: Upload Android 7 tablet APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: GAZ-Speedometer-Tablet-Android7
+          path: app/build/outputs/apk/tablet/debug/app-tablet-debug.apk
           if-no-files-found: error
