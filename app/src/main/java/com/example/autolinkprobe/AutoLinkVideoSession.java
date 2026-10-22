@@ -1,5 +1,11 @@
 package com.example.autolinkprobe;
 
+import android.content.Context;
+import android.location.Location;
+import android.hardware.display.DisplayManager;
+import android.hardware.display.VirtualDisplay;
+import android.os.Handler;
+import android.os.Looper;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
@@ -18,6 +24,45 @@ final class AutoLinkVideoSession {
     interface Sink { void send(byte[] data) throws IOException; void log(String s); }
     static final int WIDTH = 1280, HEIGHT = 720, FPS = 30;
     private final Sink sink;
+    private final Context context;
+    private final Handler ui = new Handler(Looper.getMainLooper());
+    private volatile boolean navigationMode;
+    private VirtualDisplay navigationDisplay;
+    private NavigatorPresentation navigationView;
+    private volatile RoutePlanner.Route plannedRoute;
+
+    void clearRoute() {
+        plannedRoute = null;
+        ui.post(() -> {
+            NavigatorPresentation screen = navigationView;
+            if (screen != null && screen.isShowing()) screen.clearRoute();
+        });
+    }
+
+    void setRoute(RoutePlanner.Route route) {
+        plannedRoute = route;
+        ui.post(() -> {
+            NavigatorPresentation screen = navigationView;
+            if (screen != null && screen.isShowing() && route == plannedRoute) {
+                screen.setRoute(route);
+            }
+        });
+    }
+
+    Location currentLocation() {
+        NavigatorPresentation screen = navigationView;
+        return screen == null ? null : screen.latestLocation();
+    }
+
+    synchronized boolean setNavigationMode(boolean enabled) {
+        if (streaming || channel > 0) return false;
+        navigationMode = enabled;
+        return true;
+    }
+    boolean isStreaming() { return streaming; }
+    private int sourceWidth() { return navigationMode ? 1024 : WIDTH; }
+    private int sourceHeight() { return navigationMode ? 600 : HEIGHT; }
+    private int sourceFps() { return navigationMode ? 20 : FPS; }
     private volatile boolean streaming;
     private volatile int channel = -1, pending = 0, maxPending = 1;
     private volatile int sent = 0, acked = 0;
@@ -33,7 +78,10 @@ final class AutoLinkVideoSession {
     private MediaCodec codec;
     private Surface surface;
 
-    AutoLinkVideoSession(Sink sink) { this.sink = sink; }
+    AutoLinkVideoSession(Context context, Sink sink) {
+        this.context = context;
+        this.sink = sink;
+    }
 
     synchronized void setMirrorPeerFlag(boolean enabled) { mirrorPeerFlag = enabled; }
     boolean isMirrorPeerFlag() { return mirrorPeerFlag; }
@@ -161,12 +209,12 @@ final class AutoLinkVideoSession {
         ByteArrayOutputStream payload = new ByteArrayOutputStream();
         putIntField(payload, 1, selectedConfig);
         putIntField(payload, 2, 1);
-        putIntField(payload, 3, WIDTH);
-        putIntField(payload, 4, HEIGHT);
+        putIntField(payload, 3, sourceWidth());
+        putIntField(payload, 4, sourceHeight());
         message(channel, specificFlags(), 3, payload.toByteArray());
         startRequested = true;
         sink.log("VIDEO: native START ID3; index=" + selectedConfig
-                + " session=1 resolution=" + WIDTH + "x" + HEIGHT
+                + " session=1 resolution=" + sourceWidth() + "x" + sourceHeight()
                 + " (жду START_RESPONSE ID7)");
     }
 
@@ -280,10 +328,11 @@ final class AutoLinkVideoSession {
 
     private void startCodec() {
         try {
-            MediaFormat format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, 1280, 720);
+            int width = sourceWidth(), height = sourceHeight();
+            MediaFormat format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height);
             format.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface);
-            format.setInteger(MediaFormat.KEY_BIT_RATE, 1200000);
-            format.setInteger(MediaFormat.KEY_FRAME_RATE, FPS);
+            format.setInteger(MediaFormat.KEY_BIT_RATE, navigationMode ? 1050000 : 1200000);
+            format.setInteger(MediaFormat.KEY_FRAME_RATE, sourceFps());
             format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1);
             format.setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline);
             codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC);
@@ -292,9 +341,38 @@ final class AutoLinkVideoSession {
             codec.start();
             streaming = true;
             MediaCodec encoder = codec; Surface input = surface;
-            new Thread(() -> draw(input), "autolink-testcard").start();
+            if (navigationMode) {
+                // Important: the PHONE screen is never captured. This private display
+                // has only our own Presentation window and feeds the proven H.264 path.
+                ui.post(() -> {
+                    if (!streaming || surface != input) return;
+                    try {
+                        DisplayManager dm = (DisplayManager) context.getSystemService(Context.DISPLAY_SERVICE);
+                        if (dm == null) throw new IllegalStateException("DisplayManager отсутствует");
+                        VirtualDisplay vd = dm.createVirtualDisplay(
+                                "AutoLink Independent Navigation", width, height, 160, input,
+                                DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION);
+                        if (vd == null) throw new IllegalStateException("createVirtualDisplay вернул null");
+                        navigationDisplay = vd;
+                        NavigatorPresentation screen = new NavigatorPresentation(context, vd.getDisplay());
+                        navigationView = screen;
+                        screen.show();
+                        if (plannedRoute != null) screen.setRoute(plannedRoute);
+                        sink.log("NAV: векторная карта MapLibre запущена, " + width + "x" + height
+                                + "; экран телефона НЕ зеркалируется");
+                    } catch (Exception e) {
+                        sink.log("NAV: ошибка создания виртуального экрана: " + e);
+                        stop();
+                    }
+                });
+            } else {
+                new Thread(() -> draw(input), "autolink-testcard").start();
+            }
             new Thread(() -> drain(encoder), "autolink-video-tx").start();
-        } catch (Exception e) { sink.log("VIDEO: MediaCodec ошибка: " + e); stop(); }
+        } catch (Exception e) {
+            sink.log("VIDEO: MediaCodec ошибка: " + e);
+            stop();
+        }
     }
 
     private void draw(Surface input) {
@@ -386,16 +464,29 @@ final class AutoLinkVideoSession {
     }
     private void error(Exception e) { sink.log("VIDEO: ошибка USB/протокола: " + e); stop(); }
     synchronized void stop() {
-        streaming = false; setupAccepted = focusGranted = startRequested = opened = false;
+        streaming = false;
+        setupAccepted = focusGranted = startRequested = opened = false;
         channel = -1;
         MediaCodec releasing = codec; codec = null;
         Surface oldSurface = surface; surface = null;
-        if (releasing != null || oldSurface != null) new Thread(() -> {
-            if (releasing != null) {
-                try { releasing.stop(); } catch (Exception ignored) { }
-                try { releasing.release(); } catch (Exception ignored) { }
+        NavigatorPresentation oldView = navigationView; navigationView = null;
+        VirtualDisplay oldDisplay = navigationDisplay; navigationDisplay = null;
+        // A Presentation belongs to the main looper. Release the virtual
+        // display before releasing the encoder's input Surface.
+        ui.post(() -> {
+            if (oldView != null) {
+                try { oldView.dismiss(); } catch (Exception ignored) { }
             }
-            if (oldSurface != null) oldSurface.release();
-        }, "autolink-codec-cleanup").start();
+            if (oldDisplay != null) {
+                try { oldDisplay.release(); } catch (Exception ignored) { }
+            }
+            if (releasing != null || oldSurface != null) new Thread(() -> {
+                if (releasing != null) {
+                    try { releasing.stop(); } catch (Exception ignored) { }
+                    try { releasing.release(); } catch (Exception ignored) { }
+                }
+                if (oldSurface != null) oldSurface.release();
+            }, "autolink-codec-cleanup").start();
+        });
     }
 }

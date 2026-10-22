@@ -1,5 +1,7 @@
 package com.example.autolinkprobe;
 
+import android.Manifest;
+import android.content.pm.PackageManager;
 import android.app.Activity;
 import android.app.PendingIntent;
 import android.content.BroadcastReceiver;
@@ -10,12 +12,16 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.hardware.usb.UsbAccessory;
 import android.hardware.usb.UsbManager;
+import android.location.Location;
+import android.location.LocationManager;
+import android.os.SystemClock;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.ParcelFileDescriptor;
 import android.os.Handler;
 import android.os.Looper;
 import android.widget.Button;
+import android.view.ViewGroup;
 import android.widget.EditText;
 import android.text.InputType;
 import android.widget.LinearLayout;
@@ -42,6 +48,9 @@ import java.util.Locale;
 public final class MainActivity extends Activity {
     private static final String USB_PERMISSION = "com.example.autolinkprobe.USB_PERMISSION";
     private static final int CREATE_LOG = 100;
+    private static final int REQUEST_NAV_LOCATION = 101;
+    private boolean navigationAwaitingPermission;
+    private boolean logUpdatePosted;
     private static final int MAX_READ = 65536;
     private static final int MAX_LOG_CHARS = 160000;
 
@@ -63,7 +72,7 @@ public final class MainActivity extends Activity {
     private volatile boolean videoRequested;
     private volatile int videoChannelId = -1;
     private boolean videoFlag0B = true;
-    private final AutoLinkVideoSession videoSession = new AutoLinkVideoSession(
+    private final AutoLinkVideoSession videoSession = new AutoLinkVideoSession(this,
             new AutoLinkVideoSession.Sink() {
                 @Override public void send(byte[] packet) throws IOException { sendVideoPacket(packet); }
                 @Override public void log(String line) { append(line); }
@@ -71,6 +80,10 @@ public final class MainActivity extends Activity {
     private final ByteArrayOutputStream incomingFrames = new ByteArrayOutputStream();
     private TextView logView;
     private EditText scriptEditor;
+    private EditText destinationInput;
+    private TextView stateLabel;
+    private boolean userStopped;
+    private volatile boolean routeRequestActive;
     private final ProtocolScript script = new ProtocolScript();
     private volatile boolean scriptEnabled;
     private final StringBuilder log = new StringBuilder();
@@ -87,6 +100,8 @@ public final class MainActivity extends Activity {
             } else if (UsbManager.ACTION_USB_ACCESSORY_DETACHED.equals(action)) {
                 append("USB-аксессуар отключён");
                 stopReading();
+                stopService(new Intent(MainActivity.this, NavigationLocationService.class));
+                setStatus("USB отключён. Подключи кабель — навигация запустится снова.");
                 selected = null;
             }
         }
@@ -95,85 +110,102 @@ public final class MainActivity extends Activity {
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
         usb = (UsbManager) getSystemService(USB_SERVICE);
+
         ScrollView scroll = new ScrollView(this);
+        scroll.setFillViewport(true);
+        scroll.setBackgroundColor(0xFF101A24);
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
-        int margin = (int) (16 * getResources().getDisplayMetrics().density);
-        root.setPadding(margin, margin, margin, margin);
+        int space = (int) (22 * getResources().getDisplayMetrics().density);
+        root.setPadding(space, space, space, space);
         scroll.addView(root);
 
-        root.addView(label("AutoLink USB Probe"));
-        root.addView(label("USB-диагностика и экспериментальная передача H.264 на магнитолу. Кнопка 6 запускает полный обмен."));
-        root.addView(label("Сценарий обмена (можно менять БЕЗ переустановки APK):"));
-        scriptEditor = new EditText(this);
-        scriptEditor.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
-        scriptEditor.setMinLines(5);
-        scriptEditor.setMaxLines(9);
-        scriptEditor.setTextSize(12);
-        scriptEditor.setHorizontallyScrolling(false);
-        scriptEditor.setText(getPreferences(MODE_PRIVATE).getString("usb_script", ProtocolScript.DEFAULT_SCRIPT));
-        root.addView(scriptEditor);
-        addButton(root, "Запустить сценарий (без пересборки APK)", this::runScript);
-        addButton(root, "Остановить сценарий", this::stopScript);
-        addButton(root, "Сбросить сценарий до проверенного", () -> {
-            scriptEditor.setText(ProtocolScript.DEFAULT_SCRIPT);
-            saveScript();
-            append("Редактор восстановлен до известного сценария.");
+        TextView heading = label("ГАЗЕЛЬ\nНАВИГАЦИЯ");
+        heading.setTextColor(0xFFFFFFFF);
+        heading.setTextSize(28);
+        heading.setTypeface(android.graphics.Typeface.DEFAULT,
+                android.graphics.Typeface.BOLD);
+        root.addView(heading);
+
+        TextView subtitle = label("Карта и скорость работают даже без маршрута.");
+        subtitle.setTextColor(0xFFA4BBCB);
+        root.addView(subtitle);
+
+        stateLabel = label("Подключи USB к магнитоле и открой AutoLink.");
+        stateLabel.setTextColor(0xFF98E9C8);
+        stateLabel.setBackgroundColor(0xFF203344);
+        stateLabel.setPadding(space / 2, space / 2, space / 2, space / 2);
+        root.addView(stateLabel);
+
+        addButton(root, "▶  Запустить навигацию", this::startNavigationTest);
+        TextView hint = label("Маршрут строить необязательно. После запуска "
+                + "можно погасить экран телефона.");
+        hint.setTextColor(0xFF9BAFBD);
+        root.addView(hint);
+
+        TextView where = label("Куда едем? (необязательно)");
+        where.setTextColor(0xFFFFFFFF);
+        where.setTextSize(19);
+        root.addView(where);
+
+        destinationInput = new EditText(this);
+        destinationInput.setSingleLine(true);
+        destinationInput.setTextColor(0xFFFFFFFF);
+        destinationInput.setHintTextColor(0xFF8399A9);
+        destinationInput.setTextSize(18);
+        destinationInput.setHint("Адрес или координаты");
+        destinationInput.setInputType(InputType.TYPE_CLASS_TEXT);
+        destinationInput.setText(getPreferences(MODE_PRIVATE).getString("nav_destination", ""));
+        root.addView(destinationInput);
+
+        addButton(root, "Построить маршрут", this::buildNavigationRoute);
+        addButton(root, "Сбросить маршрут • свободная езда", () -> {
+            videoSession.clearRoute();
+            append("NAV: маршрут сброшен, свободная езда.");
+            setStatus("Свободная езда: показываю карту и скорость.");
         });
-        addButton(root, "1. Найти USB-аксессуар", this::scan);
-        addButton(root, "2. Слушать USB", this::start);
-        addButton(root, "Автотест: пройти 2 известных шага", this::enableAutoTest);
-        addButton(root, "3. Ответить VERSION_RESPONSE 1.11 (один раз)", this::respondVersion);
-        addButton(root, "4. Ответить AUTH_RESPONSE (status=0)", this::respondAuth);
-        addButton(root, "5. Запросить сервисы магнитолы (SERVICE_DISCOVERY)", this::sendServiceDiscovery);
-        addButton(root, "6. Передать H.264 тест-картинку на магнитолу", this::startVideoTest);
-        addButton(root, "Режим видеопакетов: переключить 0x0B / 0x03", () -> {
-            if (listening && discoveryResponseSeen) {
-                append("VIDEO: переключение режима только до новой USB-сессии. Отключи кабель.");
-                return;
-            }
-            videoFlag0B = !videoFlag0B;
-            videoSession.setMirrorPeerFlag(videoFlag0B);
-            append("VIDEO: режим после AUTH = " + (videoFlag0B
-                    ? "0x0B (зеркалим флаг магнитолы, НЕ TLS-шифрование)"
-                    : "0x03 (обычный plaintext)") + ". Переподключи USB для нового теста.");
-        });
-        addButton(root, "Остановить тестовое видео", () -> {
+        addButton(root, "■  Остановить навигацию", () -> {
+            userStopped = true;
             videoRequested = false;
-            videoSession.stop();
-            append("VIDEO: тест остановлен вручную; USB-сессия остаётся открытой.");
+            stopReading();
+            stopService(new Intent(this, NavigationLocationService.class));
+            setStatus("Навигация остановлена. Запусти снова кнопкой выше.");
         });
-        addButton(root, "Остановить чтение", this::stopReading);
-        addButton(root, "Сохранить лог в файл", this::exportLog);
-        addButton(root, "Скопировать лог", () -> {
-            String data;
-            synchronized (log) { data = log.toString(); }
-            ((ClipboardManager) getSystemService(CLIPBOARD_SERVICE))
-                    .setPrimaryClip(ClipData.newPlainText("AutoLink USB log", data));
-            Toast.makeText(this, "Лог скопирован", Toast.LENGTH_SHORT).show();
-        });
-        logView = label("Подключи телефон по USB и нажми «Найти USB-аксессуар».");
-        logView.setTextIsSelectable(true);
-        root.addView(logView);
+
+        TextView foot = label("Карта: MapLibre + OpenFreeMap.\n"
+                + "GPS работает через постоянное уведомление Android.\n"
+                + "Для загрузки новых дорог пока требуется интернет.");
+        foot.setTextColor(0xFF8095A6);
+        foot.setTextSize(13);
+        root.addView(foot);
+
+        // Keep the complete native USB log in memory for diagnostics, but never
+        // render thousands of ACKs or expose outdated protocol-test controls.
+        logView = null;
         setContentView(scroll);
 
         IntentFilter events = new IntentFilter(USB_PERMISSION);
         events.addAction(UsbManager.ACTION_USB_ACCESSORY_DETACHED);
         if (Build.VERSION.SDK_INT >= 33) {
-            // Permission result comes via our mutable, package-targeted PendingIntent.
             registerReceiver(receiver, events, Context.RECEIVER_NOT_EXPORTED);
         } else {
             registerReceiver(receiver, events);
         }
+
         append("Android " + Build.VERSION.RELEASE + ", SDK " + Build.VERSION.SDK_INT);
-        append("Стартовый intent: " + getIntent().getAction());
         scan();
         if (selected != null) {
-            append("USB уже подключён при запуске — автоматически начинаю чтение.");
-            start();
+            append("NAV: обнаружен Sunplus. Запускаю навигацию автоматически.");
+            startNavigationTest();
         } else {
-            append("Ожидаю USB магнитолы. Лучше подключать кабель после запуска приложения.");
+            setStatus("Подключи телефон к USB магнитолы и открой AutoLink.");
         }
+    }
+
+    private void setStatus(String message) {
+        mainHandler.post(() -> {
+            if (stateLabel != null) stateLabel.setText(message);
+        });
     }
 
     private TextView label(String content) {
@@ -187,23 +219,47 @@ public final class MainActivity extends Activity {
     private void addButton(LinearLayout root, String name, Runnable action) {
         Button button = new Button(this);
         button.setText(name);
+        button.setAllCaps(false);
+        button.setTextSize(17);
+        button.setTextColor(0xFFFFFFFF);
+        button.setPadding(14, 16, 14, 16);
+        int background = name.contains("Запустить") ? 0xFF127DCC
+                : name.contains("Остановить") ? 0xFF69343C : 0xFF244157;
+        button.setBackgroundTintList(android.content.res.ColorStateList.valueOf(background));
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        params.setMargins(0, 11, 0, 4);
+        root.addView(button, params);
         button.setOnClickListener(view -> action.run());
-        root.addView(button);
     }
 
     private void append(String message) {
+        if (message.startsWith("NAV: векторная карта")) {
+            setStatus("Карта на магнитоле работает • можно заблокировать телефон.");
+        } else if (message.startsWith("NAV: ошибка") ||
+                message.startsWith("VIDEO: MediaCodec ошибка")) {
+            setStatus(message);
+        }
         String line = new SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
                 .format(new Date()) + " " + message + "\n";
-        final String snapshot;
+        boolean schedule;
         synchronized (log) {
-            if (log.length() < MAX_LOG_CHARS) {
-                log.append(line);
-            }
-            snapshot = log.toString();
+            if (log.length() < MAX_LOG_CHARS) log.append(line);
+            schedule = !logUpdatePosted;
+            if (schedule) logUpdatePosted = true;
         }
-        runOnUiThread(() -> {
-            if (logView != null) logView.setText(snapshot);
-        });
+        // RX runs up to 30+ times a second. NEVER copy and redraw the whole
+        // diagnostic log for every video ACK: it freezes the phone's main UI.
+        if (schedule) mainHandler.postDelayed(() -> {
+            String tail;
+            synchronized (log) {
+                logUpdatePosted = false;
+                int length = log.length();
+                tail = (length > 9000 ? "... [в окне показаны последние 9000 символов]\n" : "")
+                        + log.substring(Math.max(0, length - 9000), length);
+            }
+            if (logView != null) logView.setText(tail);
+        }, 350);
     }
 
     private void scan() {
@@ -289,7 +345,13 @@ public final class MainActivity extends Activity {
                             && (count = input.read(buffer)) != -1) {
                         totalRead += count;
                         int hexLength = Math.min(count, 256);
-                        append("RX " + count + " байт: " + hex(buffer, hexLength)
+                        // Frequent native ACKs are still parsed for flow control,
+                        // but not hex-dumped 30 times per second into TextView.
+                        boolean videoAck = count == 10
+                                && (buffer[0] & 0xff) == 1
+                                && (buffer[4] & 0xff) == 0
+                                && (buffer[5] & 0xff) == 6;
+                        if (!videoAck) append("RX " + count + " байт: " + hex(buffer, hexLength)
                                 + (count > hexLength ? " [остальное опущено]" : ""));
                         try {
                             processIncomingFrames(buffer, count);
@@ -408,8 +470,7 @@ public final class MainActivity extends Activity {
             } else if (channel == 0 && msgId == 6) {
                 discoveryResponseSeen = true;
                 videoChannelId = AutoLinkVideoSession.findVideoChannel(payload);
-                append("SERVICE_DISCOVERY_RESPONSE: H.264 канал=" + videoChannelId
-                        + " (параметры теста 1280x720/30fps)");
+                append("SERVICE_DISCOVERY_RESPONSE: H.264 канал=" + videoChannelId);
                 if (videoRequested && videoChannelId > 0) videoSession.open(videoChannelId);
             } else if (channel == 0 && msgId == 11 && authCompleteSeen) {
                 sendPingReply(payload);
@@ -419,7 +480,7 @@ public final class MainActivity extends Activity {
                         + "Последнее состояние: " + videoSession.state());
             } else if (channel > 0) {
                 videoSession.onRx(channel, msgId, payload);
-                append("RX VIDEO ch=" + channel + " id=0x"
+                if (msgId != 6) append("RX VIDEO ch=" + channel + " id=0x"
                         + Integer.toHexString(msgId) + " bytes=" + payload.length);
             } else {
                 append("Разобран кадр: канал=" + channel + ", флаги=" +
@@ -462,12 +523,126 @@ public final class MainActivity extends Activity {
         }
     }
 
+    private void buildNavigationRoute() {
+        if (!videoSession.isStreaming()) {
+            append("NAV: сначала запусти кнопку 7 и дождись карты на магнитоле.");
+            return;
+        }
+        if (routeRequestActive) {
+            append("NAV: предыдущий запрос маршрута ещё выполняется.");
+            return;
+        }
+        String destination = destinationInput.getText().toString().trim();
+        if (destination.length() < 3) {
+            append("NAV: укажи адрес назначения.");
+            return;
+        }
+        getPreferences(MODE_PRIVATE).edit().putString("nav_destination", destination).apply();
+        Location origin = videoSession.currentLocation();
+        if (origin == null) {
+            try {
+                LocationManager location = (LocationManager) getSystemService(LOCATION_SERVICE);
+                if (location != null && (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION)
+                        == PackageManager.PERMISSION_GRANTED || checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION)
+                        == PackageManager.PERMISSION_GRANTED)) {
+                    Location a = location.getLastKnownLocation(LocationManager.GPS_PROVIDER);
+                    Location b = location.getLastKnownLocation(LocationManager.NETWORK_PROVIDER);
+                    origin = a == null ? b : b == null ? a
+                            : a.getTime() >= b.getTime() ? a : b;
+                }
+            } catch (SecurityException ignored) { }
+        }
+        if (origin == null || Math.abs(System.currentTimeMillis() - origin.getTime()) > 300000) {
+            append("NAV: нет свежего GPS (до 5 минут). Дождись обновления координат.");
+            return;
+        }
+        routeRequestActive = true;
+        append("NAV: ищу адрес и строю маршрут; запрос только по нажатию кнопки.");
+        RoutePlanner.build(this, destination, origin, new RoutePlanner.Callback() {
+            @Override public void onReady(RoutePlanner.Route route) {
+                routeRequestActive = false;
+                if (!videoSession.isStreaming()) {
+                    append("NAV: маршрут найден, но видео уже остановлено.");
+                    return;
+                }
+                videoSession.setRoute(route);
+                setStatus("Маршрут построен. На магнитоле идёт навигация.");
+                append(String.format(Locale.US,
+                        "NAV: маршрут ПОСТРОЕН: %s, %.1f км, ~%.0f мин; "
+                                + "линия и ближайший поворот выводятся на магнитолу.",
+                        route.target, route.distanceMeters / 1000, route.durationSeconds / 60));
+            }
+            @Override public void onError(String message) {
+                routeRequestActive = false;
+                append("NAV: " + message);
+                Toast.makeText(MainActivity.this, message, Toast.LENGTH_LONG).show();
+            }
+        });
+    }
+
+    private void startNavigationTest() {
+        userStopped = false;
+        if (videoSession.isStreaming()) {
+            setStatus("Навигация уже работает. Можешь заблокировать телефон.");
+            return;
+        }
+        if (!videoSession.setNavigationMode(true)) {
+            append("NAV: сначала останови текущую видеосессию кнопкой остановки.");
+            return;
+        }
+        if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION)
+                != PackageManager.PERMISSION_GRANTED
+                && checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION)
+                != PackageManager.PERMISSION_GRANTED) {
+            navigationAwaitingPermission = true;
+            append("NAV: запрашиваю GPS для карты; без разрешения карта откроется без геопозиции.");
+            requestPermissions(new String[]{Manifest.permission.ACCESS_FINE_LOCATION,
+                    Manifest.permission.ACCESS_COARSE_LOCATION}, REQUEST_NAV_LOCATION);
+            return;
+        }
+        startLockedScreenGps();
+        setStatus("Запускаю навигацию… подключи USB и открой AutoLink.");
+        startVideoTest();
+    }
+
+    @Override public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == REQUEST_NAV_LOCATION && navigationAwaitingPermission) {
+            navigationAwaitingPermission = false;
+            if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION)
+                    != PackageManager.PERMISSION_GRANTED
+                    && checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION)
+                    != PackageManager.PERMISSION_GRANTED) {
+                append("NAV: GPS запрещён; карта запустится без местоположения.");
+            }
+            if (NavigationLocationService.hasPermission(this)) {
+                startLockedScreenGps();
+                setStatus("Запускаю карту и GPS…");
+                startVideoTest();
+            } else {
+                setStatus("Нужен доступ к GPS. Разреши местоположение и нажми «Запустить».");
+            }
+        }
+    }
+
+    private void startLockedScreenGps() {
+        try {
+            Intent intent = new Intent(this, NavigationLocationService.class);
+            if (Build.VERSION.SDK_INT >= 26) startForegroundService(intent);
+            else startService(intent);
+        } catch (RuntimeException e) {
+            append("NAV: не удалось запустить GPS в фоне: " + e);
+            setStatus("GPS в фоне недоступен: " + e.getClass().getSimpleName());
+        }
+    }
+
     private void startVideoTest() {
         videoRequested = true;
         script.stop();
         scriptEnabled = false;
         autoHandshake = true;
-        append("VIDEO: тест разрешён. Авто VERSION/AUTH/SDP, затем CHANNEL_OPEN/SETUP/FOCUS и H.264.");
+        append("VIDEO: Автоподключение AutoLink: VERSION/AUTH/SDP/SETUP/H264");
+        setStatus("Жду подключение AutoLink на магнитоле…");
         videoSession.setMirrorPeerFlag(videoFlag0B);
         if (!listening || descriptor == null) {
             append("VIDEO: USB не подключён; жду новое подключение.");
@@ -793,14 +968,16 @@ public final class MainActivity extends Activity {
             return;
         }
         scan();
-        if (selected != null && UsbManager.ACTION_USB_ACCESSORY_ATTACHED.equals(intent.getAction())) {
-            append("AOA ATTACHED — автоматически открываю USB.");
-            start();
+        if (selected != null && UsbManager.ACTION_USB_ACCESSORY_ATTACHED.equals(intent.getAction())
+                && !userStopped) {
+            append("NAV: AOA ATTACHED, запускаю карту.");
+            startNavigationTest();
         }
     }
 
     @Override protected void onDestroy() {
         stopReading();
+        stopService(new Intent(this, NavigationLocationService.class));
         unregisterReceiver(receiver);
         super.onDestroy();
     }
