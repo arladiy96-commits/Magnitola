@@ -2,10 +2,12 @@ package com.example.autolinkprobe;
 
 import android.app.Presentation;
 import android.content.Context;
+import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.Path;
+import android.graphics.PointF;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.location.Location;
@@ -19,333 +21,357 @@ import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.FrameLayout;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 
-import org.json.JSONArray;
-import org.json.JSONObject;
 import org.maplibre.android.MapLibre;
 import org.maplibre.android.camera.CameraPosition;
-import org.maplibre.android.camera.CameraUpdateFactory;
 import org.maplibre.android.geometry.LatLng;
-import org.maplibre.android.maps.MapLibreMap;
-import org.maplibre.android.maps.MapLibreMapOptions;
-import org.maplibre.android.maps.MapView;
 import org.maplibre.android.maps.Style;
-import org.maplibre.android.style.layers.LineLayer;
-import org.maplibre.android.style.sources.GeoJsonSource;
-import org.maplibre.android.style.layers.PropertyFactory;
-import org.maplibre.android.geometry.LatLng;
+import org.maplibre.android.snapshotter.MapSnapshot;
+import org.maplibre.android.snapshotter.MapSnapshotter;
 
 import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.Locale;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 
 /**
- * Genuine vector-map navigator running exclusively on the encoder-backed
- * virtual display. Driver HUD remains independent from the physical phone UI.
+ * Offscreen MapLibre -> ordinary Bitmap/ImageView -> PRIVATE VirtualDisplay.
  *
- * Routes are optional. Without one: free-drive speed, bearing, location and
- * road network all work. NavigationLocationService owns locked-screen GPS.
+ * MapLibre's TextureView/GLSurfaceView was invisible through the specific
+ * Sunplus/AutoLink MediaCodec virtual-display path while normal HUD Views
+ * appeared. MapSnapshotter renders the vector map offscreen and returns a
+ * Bitmap, which Android then composites together with the already-working
+ * speedometer and HUD using the normal View hierarchy.
+ *
+ * This is a compatibility mode, not yet a high-FPS production renderer:
+ * moving ~1 image / 1.5 s (depending on MapLibre render duration).
  */
 final class NavigatorPresentation extends Presentation {
     private static final Locale RU = new Locale("ru", "KZ");
-    private static final int BLUE = 0xFF1676F8;
     private static final String STYLE_URL = "https://tiles.openfreemap.org/styles/liberty";
-    private static final String ROUTE_SOURCE = "gaz-route-source";
-    private final Consumer<String> reportToPhone;
-    private final AtomicInteger tilesLoaded = new AtomicInteger();
-    private final AtomicInteger tileErrors = new AtomicInteger();
-    private final AtomicInteger glFrames = new AtomicInteger();
-    private String mapFailure = "";
-    private long lastHealthReport;
-    private final Handler ui = new Handler(Looper.getMainLooper());
-    private MapView mapView;
-    private MapLibreMap map;
-    private boolean styleReady;
-    private DriverArrowView arrow;
-    private TextView gpsStatus, speedText, nextArrow, nextDistance, nextInstruction;
-    private TextView remainingText, etaText, etaCaption, freeModeHint;
-    private TextView mapLoading, mapAttribution;
-    private volatile Location lastFix;
+    private static final int ROUTE_BLUE = 0xFF1682FB;
+    private static final int SNAP_WIDTH = 1024;
+    private static final int SNAP_HEIGHT = 600;
+
+    private final Handler main = new Handler(Looper.getMainLooper());
+    private final Consumer<String> report;
+    private ImageView mapImage;
+    private TextView mapStatus, gpsState, speedValue;
+    private TextView turnIcon, turnDistance, turnInstruction, distanceRemaining, eta, routeLabel;
+    private View carArrow;
+    private MapSnapshotter snapshotter;
     private RoutePlanner.Route activeRoute;
+    private volatile Location lastFix;
     private double[] metersToFinish;
     private int lastRouteVertex;
-    private boolean bearingKnown;
-    private float smoothedBearing;
-    private long lastCameraUpdate;
+    private int snapshotCount;
+    private int snapshotFailures;
+    private boolean snapshotInFlight;
+    private long requestStartedAt;
+    private long latestBitmapAt;
+    private int currentGeneration;
+    private float bearing;
+    private boolean headingValid;
+    private boolean alive;
     private final NavigationLocationService.Observer gpsObserver = this::onGps;
-    private final Runnable watchdog = new Runnable() {
+
+    private final Runnable scheduler = new Runnable() {
         @Override public void run() {
-            if (mapView == null) return;
-            Location fix = lastFix;
-            if (fix == null || SystemClock.elapsedRealtimeNanos() -
-                    fix.getElapsedRealtimeNanos() > 12_000_000_000L) {
-                speedText.setText("—");
-                gpsStatus.setText("GPS: нет сигнала");
-                gpsStatus.setTextColor(0xFFFFBC9A);
+            if (!alive) return;
+            if (snapshotInFlight && SystemClock.elapsedRealtime() - requestStartedAt > 18000) {
+                report.accept("КАРТА: MapSnapshotter завис дольше 18 с, пересоздаю рендерер");
+                replaceSnapshotter();
             }
-            ui.postDelayed(this, 3500);
+            if (!snapshotInFlight && lastFix != null) {
+                boolean moving = lastFix.hasSpeed() && lastFix.getSpeed() > 1.3f;
+                long minDelay = moving ? 1500L : 7500L;
+                if (snapshotCount == 0 || SystemClock.elapsedRealtime() - latestBitmapAt >= minDelay) {
+                    takeSnapshot();
+                }
+            }
+            main.postDelayed(this, 650);
         }
     };
 
-    NavigatorPresentation(Context context, Display display, Consumer<String> reportToPhone) {
+    NavigatorPresentation(Context context, Display display, Consumer<String> logger) {
         super(context, display);
-        this.reportToPhone = reportToPhone;
-    }
-
-    private void reportMapHealth(String reason) {
-        if (mapView == null) return;
-        long now = SystemClock.elapsedRealtime();
-        if (now - lastHealthReport < 1800) return;
-        lastHealthReport = now;
-        reportToPhone.accept("КАРТА МАГНИТОЛА: " + reason
-                + " • стиль=" + (styleReady ? "OK" : "НЕТ")
-                + " • тайлы=" + tilesLoaded.get()
-                + " • ошибки=" + tileErrors.get()
-                + " • кадры GL=" + glFrames.get()
-                + (mapFailure.isEmpty() ? "" : " • " + mapFailure));
+        report = logger;
     }
 
     private int dp(float value) {
         return Math.round(value * getContext().getResources().getDisplayMetrics().density);
     }
 
-    private GradientDrawable bg(int color, int radius) {
-        GradientDrawable d = new GradientDrawable();
-        d.setColor(color);
-        d.setCornerRadius(dp(radius));
-        return d;
+    private GradientDrawable background(int argb, int r) {
+        GradientDrawable shape = new GradientDrawable();
+        shape.setColor(argb);
+        shape.setCornerRadius(dp(r));
+        return shape;
     }
 
-    private TextView txt(String value, int size, int color, boolean bold) {
-        TextView v = new TextView(getContext());
-        v.setText(value);
-        v.setTextSize(size);
-        v.setTextColor(color);
-        v.setIncludeFontPadding(false);
-        v.setGravity(Gravity.CENTER_VERTICAL);
-        v.setMaxLines(1);
-        v.setEllipsize(TextUtils.TruncateAt.END);
-        if (bold) v.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
-        return v;
+    private TextView text(String value, float sp, int color, boolean bold) {
+        TextView t = new TextView(getContext());
+        t.setText(value);
+        t.setTextSize(sp);
+        t.setTextColor(color);
+        t.setGravity(Gravity.CENTER_VERTICAL);
+        t.setMaxLines(1);
+        t.setEllipsize(TextUtils.TruncateAt.END);
+        t.setIncludeFontPadding(false);
+        if (bold) t.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        return t;
     }
 
-    @Override protected void onCreate(Bundle state) {
-        super.onCreate(state);
-        MapLibre.getInstance(getContext());
+    @Override protected void onCreate(Bundle saved) {
+        super.onCreate(saved);
+        alive = true;
+        MapLibre.getInstance(getContext().getApplicationContext());
         FrameLayout root = new FrameLayout(getContext());
-        root.setBackgroundColor(0xFFDFE8E5);
+        root.setBackgroundColor(0xFFDDE9E7);
+        mapImage = new ImageView(getContext());
+        mapImage.setScaleType(ImageView.ScaleType.FIT_XY);
+        mapImage.setBackgroundColor(0xFFE7ECE7);
+        root.addView(mapImage, new FrameLayout.LayoutParams(-1, -1));
 
-        MapLibreMapOptions options = new MapLibreMapOptions()
-                .textureMode(true) // composited reliably onto MediaCodec VirtualDisplay
-                .zoomGesturesEnabled(false).scrollGesturesEnabled(false)
-                .rotateGesturesEnabled(false).tiltGesturesEnabled(false);
-        mapView = new MapView(getContext(), options);
-        root.addView(mapView, new FrameLayout.LayoutParams(-1, -1));
-        mapView.onCreate(null);
+        // Separate standard Android Views work on the head unit even where
+        // the original MapLibre hardware TextureView did not.
+        carArrow = new Arrow(getContext());
+        carArrow.setVisibility(View.INVISIBLE);
+        root.addView(carArrow, new FrameLayout.LayoutParams(dp(88), dp(96), Gravity.CENTER));
 
-        // The arrow stays on the GPS center. Route and vector roads rotate
-        // together based on course over ground (while moving).
-        arrow = new DriverArrowView(getContext());
-        arrow.setVisibility(View.INVISIBLE);
-        root.addView(arrow, new FrameLayout.LayoutParams(dp(82), dp(92), Gravity.CENTER));
-
-        mapLoading = txt("Загружаю векторные дороги… нужен интернет", 22, 0xFF26404F, true);
-        mapLoading.setGravity(Gravity.CENTER);
-        mapLoading.setBackground(bg(0xEFFFFFFF, 12));
-        FrameLayout.LayoutParams loadingParams =
-                new FrameLayout.LayoutParams(dp(550), dp(56), Gravity.CENTER);
-        root.addView(mapLoading, loadingParams);
+        mapStatus = text("GPS: ожидаю координаты для карты", 21, 0xFF1B3C51, true);
+        mapStatus.setGravity(Gravity.CENTER);
+        mapStatus.setBackground(background(0xEAFFFFFF, 12));
+        FrameLayout.LayoutParams progress = new FrameLayout.LayoutParams(dp(660), dp(62), Gravity.CENTER);
+        root.addView(mapStatus, progress);
 
         LinearLayout top = new LinearLayout(getContext());
-        top.setPadding(dp(15), dp(10), dp(15), dp(10));
         top.setGravity(Gravity.CENTER_VERTICAL);
-        top.setBackground(bg(0xEE102431, 14));
-        FrameLayout.LayoutParams topParams =
-                new FrameLayout.LayoutParams(-1, dp(102), Gravity.TOP);
-        topParams.setMargins(dp(12), dp(10), dp(12), 0);
-        root.addView(top, topParams);
+        top.setPadding(dp(15), dp(12), dp(15), dp(12));
+        top.setBackground(background(0xF3112837, 13));
+        FrameLayout.LayoutParams topLayout = new FrameLayout.LayoutParams(-1, dp(100), Gravity.TOP);
+        topLayout.setMargins(dp(12), dp(10), dp(12), 0);
+        root.addView(top, topLayout);
 
-        nextArrow = txt("↑", 52, Color.WHITE, true);
-        nextArrow.setGravity(Gravity.CENTER);
-        nextArrow.setBackground(bg(0xFF176CDA, 11));
-        top.addView(nextArrow, new LinearLayout.LayoutParams(dp(78), -1));
+        turnIcon = text("↑", 51, Color.WHITE, true);
+        turnIcon.setGravity(Gravity.CENTER);
+        turnIcon.setBackground(background(0xFF1168D2, 10));
+        top.addView(turnIcon, new LinearLayout.LayoutParams(dp(83), -1));
 
-        LinearLayout maneuver = new LinearLayout(getContext());
-        maneuver.setGravity(Gravity.CENTER_VERTICAL);
-        maneuver.setPadding(dp(15), 0, dp(8), 0);
-        maneuver.setOrientation(LinearLayout.VERTICAL);
-        nextDistance = txt("СВОБОДНАЯ ЕЗДА", 31, Color.WHITE, true);
-        nextInstruction = txt("Маршрут не нужен — просто едь", 19, 0xFFB7D2E6, false);
-        nextInstruction.setPadding(0, dp(5), 0, 0);
-        maneuver.addView(nextDistance);
-        maneuver.addView(nextInstruction);
-        top.addView(maneuver, new LinearLayout.LayoutParams(0, -1, 1));
+        LinearLayout turn = new LinearLayout(getContext());
+        turn.setOrientation(LinearLayout.VERTICAL);
+        turn.setGravity(Gravity.CENTER_VERTICAL);
+        turn.setPadding(dp(16), 0, dp(6), 0);
+        turnDistance = text("СВОБОДНАЯ ЕЗДА", 30, Color.WHITE, true);
+        turnInstruction = text("Маршрут не нужен — просто едь", 19, 0xFFBED9EB, false);
+        turnInstruction.setPadding(0, dp(5), 0, 0);
+        turn.addView(turnDistance);
+        turn.addView(turnInstruction);
+        top.addView(turn, new LinearLayout.LayoutParams(0, -1, 1f));
 
-        gpsStatus = txt("Ожидаю GPS", 17, 0xFFC7E5F4, true);
-        gpsStatus.setGravity(Gravity.RIGHT | Gravity.CENTER_VERTICAL);
-        top.addView(gpsStatus, new LinearLayout.LayoutParams(dp(148), -1));
+        gpsState = text("GPS…", 17, 0xFFC5E4F9, true);
+        gpsState.setGravity(Gravity.CENTER_VERTICAL | Gravity.RIGHT);
+        top.addView(gpsState, new LinearLayout.LayoutParams(dp(148), -1));
 
         LinearLayout bottom = new LinearLayout(getContext());
-        bottom.setPadding(dp(20), dp(5), dp(18), dp(5));
+        bottom.setPadding(dp(19), dp(7), dp(17), dp(7));
         bottom.setGravity(Gravity.CENTER_VERTICAL);
-        bottom.setBackground(bg(0xF0102431, 14));
-        FrameLayout.LayoutParams bottomParams =
+        bottom.setBackground(background(0xF2112837, 13));
+        FrameLayout.LayoutParams bottomLayout =
                 new FrameLayout.LayoutParams(-1, dp(112), Gravity.BOTTOM);
-        bottomParams.setMargins(dp(12), 0, dp(12), dp(10));
-        root.addView(bottom, bottomParams);
+        bottomLayout.setMargins(dp(12), 0, dp(12), dp(10));
+        root.addView(bottom, bottomLayout);
 
-        LinearLayout speedBox = new LinearLayout(getContext());
-        speedBox.setOrientation(LinearLayout.VERTICAL);
-        speedBox.setGravity(Gravity.CENTER_VERTICAL);
-        speedText = txt("—", 65, Color.WHITE, true);
-        TextView speedLabel = txt("км/ч • GPS", 17, 0xFFB7D2E6, false);
-        speedBox.addView(speedText);
-        speedBox.addView(speedLabel);
-        bottom.addView(speedBox, new LinearLayout.LayoutParams(dp(210), -1));
+        LinearLayout speed = new LinearLayout(getContext());
+        speed.setOrientation(LinearLayout.VERTICAL);
+        speed.setGravity(Gravity.CENTER_VERTICAL);
+        speedValue = text("—", 65, Color.WHITE, true);
+        speed.addView(speedValue);
+        speed.addView(text("км/ч · GPS", 17, 0xFFB8D3E5, false));
+        bottom.addView(speed, new LinearLayout.LayoutParams(dp(204), -1));
 
-        View divider = new View(getContext());
-        divider.setBackgroundColor(0xFF45616F);
-        bottom.addView(divider, new LinearLayout.LayoutParams(dp(1), dp(76)));
+        View separator = new View(getContext());
+        separator.setBackgroundColor(0xFF526D7A);
+        bottom.addView(separator, new LinearLayout.LayoutParams(dp(1), dp(74)));
 
-        LinearLayout details = new LinearLayout(getContext());
-        details.setOrientation(LinearLayout.VERTICAL);
-        details.setGravity(Gravity.CENTER_VERTICAL);
-        details.setPadding(dp(25), 0, dp(8), 0);
-        remainingText = txt("Карта по курсу", 29, Color.WHITE, true);
-        freeModeHint = txt("Твоё положение и скорость", 16, 0xFFB7D2E6, false);
-        details.addView(remainingText);
-        details.addView(freeModeHint);
-        bottom.addView(details, new LinearLayout.LayoutParams(0, -1, 1));
+        LinearLayout rest = new LinearLayout(getContext());
+        rest.setOrientation(LinearLayout.VERTICAL);
+        rest.setGravity(Gravity.CENTER_VERTICAL);
+        rest.setPadding(dp(20), 0, 0, 0);
+        distanceRemaining = text("Карта по курсу", 27, Color.WHITE, true);
+        routeLabel = text("Положение и скорость", 17, 0xFFB8D3E5, false);
+        rest.addView(distanceRemaining);
+        rest.addView(routeLabel);
+        bottom.addView(rest, new LinearLayout.LayoutParams(0, -1, 1f));
 
-        LinearLayout etaBox = new LinearLayout(getContext());
-        etaBox.setOrientation(LinearLayout.VERTICAL);
-        etaBox.setGravity(Gravity.CENTER_VERTICAL);
-        etaValuePlaceholder(etaBox);
-        bottom.addView(etaBox, new LinearLayout.LayoutParams(dp(175), -1));
+        LinearLayout time = new LinearLayout(getContext());
+        time.setOrientation(LinearLayout.VERTICAL);
+        time.setGravity(Gravity.CENTER_VERTICAL);
+        eta = text("—:—", 38, Color.WHITE, true);
+        time.addView(eta);
+        time.addView(text("Прибытие ≈", 17, 0xFFB8D3E5, false));
+        bottom.addView(time, new LinearLayout.LayoutParams(dp(185), -1));
 
-        mapAttribution = txt("© OpenStreetMap contributors · OpenFreeMap", 13, Color.WHITE, false);
-        mapAttribution.setPadding(dp(8), dp(4), dp(8), dp(4));
-        mapAttribution.setBackground(bg(0xD0102530, 4));
-        FrameLayout.LayoutParams attrParams = new FrameLayout.LayoutParams(-2, -2,
-                Gravity.RIGHT | Gravity.BOTTOM);
-        attrParams.setMargins(0, 0, dp(14), dp(131));
-        root.addView(mapAttribution, attrParams);
+        TextView credits = text("© OpenStreetMap contributors · OpenFreeMap", 13, Color.WHITE, false);
+        credits.setBackground(background(0xC8112431, 3));
+        credits.setPadding(dp(6), dp(3), dp(6), dp(3));
+        FrameLayout.LayoutParams creditsLayout =
+                new FrameLayout.LayoutParams(-2, -2, Gravity.RIGHT | Gravity.BOTTOM);
+        creditsLayout.setMargins(0, 0, dp(15), dp(130));
+        root.addView(credits, creditsLayout);
 
         setContentView(root);
-        mapView.addOnDidFailLoadingMapListener(error -> {
-            mapFailure = error;
-            ui.post(() -> {
-                if (mapLoading != null) {
-                    mapLoading.setText("Ошибка карты: " + error);
-                    mapLoading.setVisibility(View.VISIBLE);
-                }
-                reportMapHealth("ошибка MapLibre");
-            });
-        });
-        mapView.addOnTileActionListener((op, x, y, z, wrap, overscaledZ, sourceId) -> {
-            String kind = String.valueOf(op);
-            if (kind.contains("LoadFromNetwork") || kind.contains("LoadFromCache")
-                    || kind.contains("LoadFromDatabase")) {
-                if (tilesLoaded.incrementAndGet() == 1) ui.post(() -> {
-                    if (mapLoading != null && styleReady && mapFailure.isEmpty())
-                        mapLoading.setVisibility(View.GONE);
-                    reportMapHealth("дороги скачиваются");
-                });
-            } else if (kind.contains("Error")) {
-                if (tileErrors.incrementAndGet() == 1)
-                    ui.post(() -> reportMapHealth("ошибка тайлов"));
-            }
-        });
-        mapView.addOnDidFinishRenderingFrameListener((fully, encodingTime, renderingTime) -> {
-            if (glFrames.incrementAndGet() == 1)
-                ui.post(() -> reportMapHealth("GL рендер начал работу"));
-        });
-        mapView.onStart();
-        mapView.onResume();
-        mapView.getMapAsync(readyMap -> {
-            reportMapHealth("MapLibre готов");
-            if (mapView == null) return;
-            map = readyMap;
-            readyMap.getUiSettings().setAllGesturesEnabled(false);
-            readyMap.setStyle(STYLE_URL, style -> {
-                if (mapView == null) return;
-                styleReady = true;
-                if (tilesLoaded.get() > 0) mapLoading.setVisibility(View.GONE);
-                else mapLoading.setText("Стиль загружен. Жду тайлы дорог…");
-                reportMapHealth("стиль загружен");
-                if (activeRoute != null) installRoute(style, activeRoute);
-                Location fix = NavigationLocationService.latestLocation();
-                if (fix != null) onGps(fix);
-            });
-            Location fix = NavigationLocationService.latestLocation();
-            if (fix != null) onGps(fix);
-        });
         NavigationLocationService.subscribe(gpsObserver);
-        ui.postDelayed(watchdog, 3500);
-        ui.postDelayed(() -> {
-            if (mapView == null) return;
-            if (!styleReady) {
-                mapLoading.setText("Стиль карты не загрузился. Проверь интернет.");
-                reportMapHealth("нет стиля через 15 сек");
-            } else if (tilesLoaded.get() == 0) {
-                mapLoading.setText("Тайлы дорог не пришли. Проверь карту на телефоне.");
-                reportMapHealth("нет тайлов через 15 сек");
-            } else {
-                reportMapHealth("карта загрузила тайлы");
-            }
-        }, 15000);
+        main.postDelayed(scheduler, 600);
     }
 
-    private void etaValuePlaceholder(LinearLayout etaBox) {
-        etaText = txt("—:—", 36, Color.WHITE, true);
-        etaCaption = txt("Время прибытия", 16, 0xFFB7D2E6, false);
-        etaBox.addView(etaText);
-        etaBox.addView(etaCaption);
-    }
-
-    private void onGps(Location location) {
-        if (mapView == null) return;
-        lastFix = new Location(location);
-        gpsStatus.setTextColor(0xFFC7E5F4);
-        gpsStatus.setText(location.hasAccuracy()
-                ? String.format(RU, "GPS ±%.0f м", location.getAccuracy())
+    private void onGps(Location fix) {
+        if (!alive || mapImage == null) return;
+        lastFix = new Location(fix);
+        gpsState.setTextColor(0xFFC5E4F9);
+        gpsState.setText(fix.hasAccuracy()
+                ? String.format(RU, "GPS ±%.0f м", fix.getAccuracy())
                 : "GPS работает");
-        speedText.setText(location.hasSpeed()
-                ? String.format(RU, "%.0f", location.getSpeed() * 3.6 < 3. ? 0.
-                        : location.getSpeed() * 3.6)
-                : "—");
-        arrow.setVisibility(View.VISIBLE);
-        // Real GNSS bearing is meaningful only while moving; parking jitter
-        // must not spin the roads continuously.
-        if (location.hasBearing() && location.hasSpeed() && location.getSpeed() > 2.75f) {
-            float candidate = (location.getBearing() + 360f) % 360f;
-            if (!bearingKnown) {
-                smoothedBearing = candidate;
-                bearingKnown = true;
+        if (fix.hasSpeed()) {
+            double kmh = fix.getSpeed() * 3.6;
+            speedValue.setText(String.format(RU, "%.0f", kmh < 3.0 ? 0 : kmh));
+        } else {
+            speedValue.setText("—");
+        }
+        carArrow.setVisibility(View.VISIBLE);
+
+        if (fix.hasBearing() && fix.hasSpeed() && fix.getSpeed() >= 2.7f
+                && (!fix.hasAccuracy() || fix.getAccuracy() < 50f)) {
+            float next = (fix.getBearing() + 360f) % 360f;
+            if (!headingValid) {
+                bearing = next;
+                headingValid = true;
             } else {
-                float delta = ((candidate - smoothedBearing + 540f) % 360f) - 180f;
-                smoothedBearing = (smoothedBearing + delta * .35f + 360f) % 360f;
+                float difference = ((next - bearing + 540f) % 360f) - 180f;
+                bearing = (bearing + difference * .40f + 360f) % 360f;
             }
         }
-        if (map != null) {
-            long now = SystemClock.elapsedRealtime();
-            if (now - lastCameraUpdate > 600) {
-                lastCameraUpdate = now;
-                double zoom = location.hasSpeed() && location.getSpeed() > 22.0 ? 15.8 : 17.1;
-                CameraPosition camera = new CameraPosition.Builder()
-                        .target(new LatLng(location.getLatitude(), location.getLongitude()))
-                        .zoom(zoom)
-                        .bearing(bearingKnown ? smoothedBearing : 0)
-                        .tilt(bearingKnown ? 35 : 0)
-                        .build();
-                map.moveCamera(CameraUpdateFactory.newCameraPosition(camera));
-            }
+
+        if (activeRoute != null) updateProgress(fix);
+    }
+
+    private CameraPosition cameraFor(Location fix) {
+        double zoom = fix.hasSpeed() && fix.getSpeed() > 22f ? 15.8 : 17.1;
+        return new CameraPosition.Builder()
+                .target(new LatLng(fix.getLatitude(), fix.getLongitude()))
+                .bearing(headingValid ? bearing : 0.0)
+                .tilt(headingValid ? 30.0 : 0.0)
+                .zoom(zoom)
+                .build();
+    }
+
+    private void replaceSnapshotter() {
+        currentGeneration++;
+        if (snapshotter != null) {
+            snapshotter.cancel();
+            snapshotter = null;
         }
-        if (activeRoute != null) updateManeuver(location);
+        snapshotInFlight = false;
+        Location fix = lastFix;
+        if (!alive || fix == null) return;
+        try {
+            MapSnapshotter.Options options = new MapSnapshotter.Options(SNAP_WIDTH, SNAP_HEIGHT)
+                    .withPixelRatio(1f)
+                    .withStyleBuilder(new Style.Builder().fromUri(STYLE_URL))
+                    .withCameraPosition(cameraFor(fix));
+            snapshotter = new MapSnapshotter(getContext().getApplicationContext(), options);
+            report.accept("КАРТА: новый оффскрин MapSnapshotter готов");
+        } catch (RuntimeException exception) {
+            snapshotFailures++;
+            mapStatus.setText("Карта: ошибка MapSnapshotter");
+            report.accept("КАРТА: создание Snapshotter: " + exception);
+        }
+    }
+
+    private void takeSnapshot() {
+        if (!alive || lastFix == null || snapshotInFlight) return;
+        if (snapshotter == null) replaceSnapshotter();
+        if (snapshotter == null) return;
+        snapshotInFlight = true;
+        requestStartedAt = SystemClock.elapsedRealtime();
+        final int generation = currentGeneration;
+        try {
+            snapshotter.setCameraPosition(cameraFor(lastFix));
+            snapshotter.start(
+                    snapshot -> {
+                        if (!alive || generation != currentGeneration || mapImage == null) return;
+                        snapshotInFlight = false;
+                        latestBitmapAt = SystemClock.elapsedRealtime();
+                        snapshotCount++;
+                        Bitmap image = snapshot.getBitmap();
+                        if (image != null) {
+                            // Drawing the route directly on the bitmap avoids
+                            // a second fragile OpenGL layer on the virtual display.
+                            if (activeRoute != null) drawRouteOnSnapshot(snapshot, image);
+                            mapImage.setImageBitmap(image);
+                            mapStatus.setVisibility(View.GONE);
+                            if (snapshotCount == 1 || snapshotCount % 20 == 0) {
+                                report.accept("КАРТА: готово " + snapshotCount
+                                        + " Bitmap-кадров, размер="
+                                        + image.getWidth() + "x" + image.getHeight());
+                            }
+                        } else {
+                            mapStatus.setText("Карта вернула пустой Bitmap");
+                            report.accept("КАРТА: снимок без Bitmap");
+                        }
+                    },
+                    error -> {
+                        if (!alive || generation != currentGeneration) return;
+                        snapshotInFlight = false;
+                        latestBitmapAt = SystemClock.elapsedRealtime();
+                        snapshotFailures++;
+                        mapStatus.setVisibility(View.VISIBLE);
+                        mapStatus.setText("Ошибка карты: " + error);
+                        report.accept("КАРТА: ошибка снимка #" + snapshotFailures + ": " + error);
+                    });
+        } catch (RuntimeException error) {
+            snapshotInFlight = false;
+            latestBitmapAt = SystemClock.elapsedRealtime();
+            report.accept("КАРТА: исключение MapSnapshotter: " + error);
+            mapStatus.setText("MapLibre: ошибка построения кадра");
+        }
+    }
+
+    private void drawRouteOnSnapshot(MapSnapshot snapshot, Bitmap bitmap) {
+        if (!bitmap.isMutable() || activeRoute == null) return;
+        // Avoid huge UI-thread work for intercity routes.
+        int points = activeRoute.geometry.size();
+        if (points < 2) return;
+        int stride = Math.max(1, (int) Math.ceil(points / 2500.0));
+        Path road = new Path();
+        try {
+            boolean begun = false;
+            for (int i = 0; i < points; i += stride) {
+                PointF p = snapshot.pixelForLatLng(activeRoute.geometry.get(i));
+                if (!Float.isFinite(p.x) || !Float.isFinite(p.y)) continue;
+                if (!begun) { road.moveTo(p.x, p.y); begun = true; }
+                else road.lineTo(p.x, p.y);
+            }
+            PointF end = snapshot.pixelForLatLng(
+                    activeRoute.geometry.get(points - 1));
+            road.lineTo(end.x, end.y);
+            Canvas canvas = new Canvas(bitmap);
+            Paint stroke = new Paint(Paint.ANTI_ALIAS_FLAG);
+            stroke.setStyle(Paint.Style.STROKE);
+            stroke.setStrokeJoin(Paint.Join.ROUND);
+            stroke.setStrokeCap(Paint.Cap.ROUND);
+            stroke.setColor(Color.WHITE);
+            stroke.setStrokeWidth(13);
+            canvas.drawPath(road, stroke);
+            stroke.setColor(ROUTE_BLUE);
+            stroke.setStrokeWidth(8);
+            canvas.drawPath(road, stroke);
+        } catch (RuntimeException error) {
+            report.accept("КАРТА: маршрут поверх Bitmap: " + error);
+        }
     }
 
     Location latestLocation() {
@@ -353,7 +379,7 @@ final class NavigatorPresentation extends Presentation {
     }
 
     void setRoute(RoutePlanner.Route route) {
-        if (mapView == null || route == null) return;
+        if (!alive || route == null) return;
         activeRoute = route;
         lastRouteVertex = 0;
         metersToFinish = new double[route.geometry.size()];
@@ -361,121 +387,73 @@ final class NavigatorPresentation extends Presentation {
             metersToFinish[i] = metersToFinish[i + 1]
                     + RoutePlanner.meters(route.geometry.get(i), route.geometry.get(i + 1));
         }
-        etaText.setText(etaTime(route.durationSeconds));
-        remainingText.setText(formatDistance(route.distanceMeters));
-        freeModeHint.setText("Осталось до финиша");
-        etaCaption.setText("Прибытие ≈");
-        if (map != null && styleReady) {
-            Style style = map.getStyle();
-            if (style != null) installRoute(style, route);
-        }
-        if (lastFix != null) updateManeuver(lastFix);
+        distanceRemaining.setText(distance(route.distanceMeters));
+        routeLabel.setText("Осталось до финиша");
+        eta.setText(etaAt(route.durationSeconds));
+        if (lastFix != null) updateProgress(lastFix);
+        latestBitmapAt = 0;
     }
 
     void clearRoute() {
         activeRoute = null;
         metersToFinish = null;
         lastRouteVertex = 0;
-        nextArrow.setText("↑");
-        nextDistance.setText("СВОБОДНАЯ ЕЗДА");
-        nextInstruction.setText("Маршрут не нужен — просто едь");
-        remainingText.setText("Карта по курсу");
-        freeModeHint.setText("Твоё положение и скорость");
-        etaText.setText("—:—");
-        etaCaption.setText("Время прибытия");
-        if (map != null && styleReady) {
-            Style style = map.getStyle();
-            if (style != null) {
-                if (style.getLayer("gaz-route-fill") != null) style.removeLayer("gaz-route-fill");
-                if (style.getLayer("gaz-route-outline") != null) style.removeLayer("gaz-route-outline");
-                if (style.getSource(ROUTE_SOURCE) != null) style.removeSource(ROUTE_SOURCE);
-            }
-        }
+        turnIcon.setText("↑");
+        turnDistance.setText("СВОБОДНАЯ ЕЗДА");
+        turnInstruction.setText("Маршрут не нужен — просто едь");
+        distanceRemaining.setText("Карта по курсу");
+        routeLabel.setText("Положение и скорость");
+        eta.setText("—:—");
+        latestBitmapAt = 0;
     }
 
-    private void installRoute(Style style, RoutePlanner.Route route) {
-        try {
-            // Drop layers before source; otherwise style errors on new routes.
-            if (style.getLayer("gaz-route-fill") != null) style.removeLayer("gaz-route-fill");
-            if (style.getLayer("gaz-route-outline") != null) style.removeLayer("gaz-route-outline");
-            if (style.getSource(ROUTE_SOURCE) != null) style.removeSource(ROUTE_SOURCE);
-            JSONArray points = new JSONArray();
-            for (LatLng p : route.geometry) {
-                points.put(new JSONArray().put(p.getLongitude()).put(p.getLatitude()));
-            }
-            JSONObject geo = new JSONObject();
-            geo.put("type", "Feature");
-            geo.put("geometry", new JSONObject().put("type", "LineString")
-                    .put("coordinates", points));
-            geo.put("properties", new JSONObject());
-            JSONObject collection = new JSONObject()
-                    .put("type", "FeatureCollection")
-                    .put("features", new JSONArray().put(geo));
-            style.addSource(new GeoJsonSource(ROUTE_SOURCE, collection.toString()));
-            LineLayer casing = new LineLayer("gaz-route-outline", ROUTE_SOURCE);
-            casing.setProperties(PropertyFactory.lineColor(Color.WHITE),
-                    PropertyFactory.lineWidth(13f));
-            style.addLayer(casing);
-            LineLayer fill = new LineLayer("gaz-route-fill", ROUTE_SOURCE);
-            fill.setProperties(PropertyFactory.lineColor(BLUE),
-                    PropertyFactory.lineWidth(8f));
-            style.addLayer(fill);
-        } catch (Exception e) {
-            nextInstruction.setText("Ошибка отображения линии маршрута");
-        }
+    private static String distance(double meters) {
+        return meters >= 1000 ? String.format(RU, "%.1f км", meters / 1000.0)
+                : String.format(RU, "%.0f м", Math.max(0, meters));
     }
 
-    private static String formatDistance(double meters) {
-        if (meters >= 1000) return String.format(RU, "%.1f км", meters / 1000);
-        return String.format(RU, "%.0f м", Math.max(0, meters));
+    private static String etaAt(double seconds) {
+        return new SimpleDateFormat("HH:mm", RU)
+                .format(new Date(System.currentTimeMillis() + (long) (Math.max(0, seconds) * 1000)));
     }
 
-    private static String etaTime(double seconds) {
-        long when = System.currentTimeMillis() + (long) (Math.max(0, seconds) * 1000);
-        return new SimpleDateFormat("HH:mm", RU).format(new Date(when));
-    }
-
-    private void updateManeuver(Location location) {
+    private void updateProgress(Location fix) {
         RoutePlanner.Route route = activeRoute;
-        if (route == null || route.geometry.size() < 2) return;
+        if (route == null || route.geometry.size() < 2 || metersToFinish == null) return;
         int best = lastRouteVertex;
         double nearest = Double.POSITIVE_INFINITY;
-        int from = Math.max(0, lastRouteVertex - 30);
-        int to = Math.min(route.geometry.size(), lastRouteVertex + 450);
+        int from = Math.max(0, lastRouteVertex - 40);
+        int to = Math.min(route.geometry.size(), lastRouteVertex + 470);
         for (int i = from; i < to; i++) {
-            double d = approxMeters(location.getLatitude(), location.getLongitude(), route.geometry.get(i));
+            double d = approxMeters(fix.getLatitude(), fix.getLongitude(), route.geometry.get(i));
             if (d < nearest) { nearest = d; best = i; }
         }
-        if (nearest > 180) {
-            nearest = Double.POSITIVE_INFINITY;
+        if (nearest > 160) {
             for (int i = 0; i < route.geometry.size(); i++) {
-                double d = approxMeters(location.getLatitude(), location.getLongitude(), route.geometry.get(i));
+                double d = approxMeters(fix.getLatitude(), fix.getLongitude(), route.geometry.get(i));
                 if (d < nearest) { nearest = d; best = i; }
             }
         }
         lastRouteVertex = best;
-        if (nearest > Math.max(100, location.hasAccuracy() ? 2 * location.getAccuracy() : 100)) {
-            nextArrow.setText("!");
-            nextDistance.setText("ВНЕ МАРШРУТА");
-            nextInstruction.setText("Построй маршрут снова");
-            etaText.setText("—:—");
+        if (nearest > Math.max(100, fix.hasAccuracy() ? 2 * fix.getAccuracy() : 100)) {
+            turnIcon.setText("!");
+            turnDistance.setText("ВНЕ МАРШРУТА");
+            turnInstruction.setText("Перестрой маршрут на телефоне");
+            eta.setText("—:—");
             return;
         }
         double left = metersToFinish[best];
-        remainingText.setText(formatDistance(left));
-        double fraction = route.distanceMeters > 1 ?
-                Math.min(1, left / route.distanceMeters) : 0;
-        double seconds = fraction * route.durationSeconds;
-        etaText.setText(etaTime(seconds));
-        etaCaption.setText("Прибытие ≈");
+        distanceRemaining.setText(distance(left));
+        eta.setText(etaAt(route.distanceMeters > 0
+                ? Math.min(1, left / route.distanceMeters) * route.durationSeconds : 0));
         if (left < 35) {
-            nextArrow.setText("✓");
-            nextDistance.setText("ПРИЕХАЛИ");
-            nextInstruction.setText(route.target);
+            turnIcon.setText("✓");
+            turnDistance.setText("ПРИЕХАЛИ");
+            turnInstruction.setText(route.target);
             return;
         }
-        RoutePlanner.Maneuver next = null;
         double toTurn = left;
+        RoutePlanner.Maneuver next = null;
         for (RoutePlanner.Maneuver m : route.maneuvers) {
             if (m.pathIndex >= best + 1) {
                 next = m;
@@ -483,73 +461,73 @@ final class NavigatorPresentation extends Presentation {
                 break;
             }
         }
-        nextArrow.setText(directionArrow(next));
-        nextDistance.setText(formatDistance(toTurn));
-        nextInstruction.setText(next == null ? "Двигайся до пункта назначения" : next.instruction);
+        turnIcon.setText(turnArrow(next));
+        turnDistance.setText(distance(toTurn));
+        turnInstruction.setText(next == null ? "Двигайся к пункту назначения" : next.instruction);
     }
 
-    private static String directionArrow(RoutePlanner.Maneuver maneuver) {
-        if (maneuver == null) return "↑";
-        String line = maneuver.instruction.toLowerCase(RU);
-        if (line.contains("развер")) return "↶";
-        if (line.contains("круг")) return "⟳";
-        if (line.contains("налево")) return "↰";
-        if (line.contains("направо")) return "↱";
+    private static String turnArrow(RoutePlanner.Maneuver m) {
+        if (m == null) return "↑";
+        String name = m.instruction.toLowerCase(RU);
+        if (name.contains("развер")) return "↶";
+        if (name.contains("круг")) return "⟳";
+        if (name.contains("налево")) return "↰";
+        if (name.contains("направо")) return "↱";
         return "↑";
     }
 
     private static double approxMeters(double lat, double lon, LatLng road) {
-        double y = (lat - road.getLatitude()) * 111132.;
-        double x = (lon - road.getLongitude()) * 111320.
-                * Math.cos(Math.toRadians(lat));
+        double x = (lon - road.getLongitude()) * 111320 * Math.cos(Math.toRadians(lat));
+        double y = (lat - road.getLatitude()) * 111132;
         return Math.hypot(x, y);
     }
 
-    private static final class DriverArrowView extends View {
-        private final Paint pen = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private static final class Arrow extends View {
+        private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Path path = new Path();
-        DriverArrowView(Context c) {
-            super(c);
-            setLayerType(View.LAYER_TYPE_SOFTWARE, null);
-        }
+        Arrow(Context ctx) { super(ctx); }
         @Override protected void onDraw(Canvas canvas) {
+            super.onDraw(canvas);
             canvas.save();
             canvas.translate(getWidth() / 2f, getHeight() / 2f);
-            float scale = Math.min(getWidth() / 82f, getHeight() / 92f);
-            canvas.scale(scale, scale);
-            pen.setStyle(Paint.Style.FILL);
-            pen.setColor(0x4C1676F8);
-            canvas.drawCircle(0, 0, 36, pen);
+            canvas.scale(Math.min(getWidth() / 88f, getHeight() / 96f),
+                    Math.min(getWidth() / 88f, getHeight() / 96f));
+            paint.setColor(0x501682FB);
+            paint.setStyle(Paint.Style.FILL);
+            canvas.drawCircle(0, 0, 39, paint);
             path.reset();
-            path.moveTo(0, -36);
-            path.lineTo(25, 29);
-            path.lineTo(0, 16);
-            path.lineTo(-25, 29);
+            path.moveTo(0, -40);
+            path.lineTo(29, 33);
+            path.lineTo(0, 18);
+            path.lineTo(-29, 33);
             path.close();
-            pen.setColor(Color.WHITE);
-            pen.setStyle(Paint.Style.STROKE);
-            pen.setStrokeWidth(8f);
-            pen.setStrokeJoin(Paint.Join.ROUND);
-            canvas.drawPath(path, pen);
-            pen.setStyle(Paint.Style.FILL);
-            pen.setColor(BLUE);
-            canvas.drawPath(path, pen);
+            paint.setColor(Color.WHITE);
+            paint.setStyle(Paint.Style.STROKE);
+            paint.setStrokeJoin(Paint.Join.ROUND);
+            paint.setStrokeWidth(9);
+            canvas.drawPath(path, paint);
+            paint.setColor(ROUTE_BLUE);
+            paint.setStyle(Paint.Style.FILL);
+            canvas.drawPath(path, paint);
             canvas.restore();
         }
     }
 
     @Override protected void onStop() {
-        ui.removeCallbacks(watchdog);
+        alive = false;
+        main.removeCallbacks(scheduler);
         NavigationLocationService.unsubscribe(gpsObserver);
+        currentGeneration++;
+        if (snapshotter != null) {
+            snapshotter.cancel();
+            snapshotter = null;
+        }
+        snapshotInFlight = false;
+        if (mapImage != null) mapImage.setImageDrawable(null);
+        mapImage = null;
         lastFix = null;
         activeRoute = null;
-        if (mapView != null) {
-            mapView.onPause();
-            mapView.onStop();
-            mapView.onDestroy();
-            mapView = null;
-        }
-        map = null;
+        metersToFinish = null;
         super.onStop();
     }
 }
