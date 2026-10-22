@@ -57,7 +57,7 @@ public final class MainActivity extends Activity {
     private static final int MAX_READ = 65536;
     private static final int MAX_LOG_CHARS = 160000;
 
-    private final SpeedometerDashboard dashboard = new SpeedometerDashboard();
+    private final SpeedometerDashboard dashboard = SpeedometerDashboard.get();
     private View dashboardPreview;
     private ScrollView diagnosticsView;
     private TextView connectionStatus;
@@ -176,6 +176,10 @@ public final class MainActivity extends Activity {
         // Same Canvas renderer powers this phone preview and the independent
         // 1280x720 MediaCodec Surface sent via USB to the head unit.
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        getWindow().getDecorView().setSystemUiVisibility(
+                View.SYSTEM_UI_FLAG_FULLSCREEN | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION |
+                View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY);
+        setRequestedOrientation(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
         FrameLayout stage = new FrameLayout(this);
         dashboardPreview = new View(this) {
             @Override protected void onDraw(Canvas canvas) {
@@ -222,6 +226,9 @@ public final class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
                 Gravity.BOTTOM);
         stage.addView(controls, controlParams);
+        controls.setVisibility(View.GONE);
+        dashboardPreview.setOnClickListener(v -> controls.setVisibility(
+                controls.getVisibility() == View.VISIBLE ? View.GONE : View.VISIBLE));
         setContentView(stage);
         startGps();
 
@@ -830,30 +837,19 @@ public final class MainActivity extends Activity {
         });
     }
 
-    /** GPS operates fully offline; do not display invented zero if fixes are stale. */
+    /** Keep GPS running when the phone is minimized. Start while Activity is visible. */
     private void startGps() {
         if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION)
                 != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(new String[]{Manifest.permission.ACCESS_FINE_LOCATION}, LOCATION_REQUEST);
             return;
         }
-        if (locationManager == null) {
-            locationManager = (LocationManager) getSystemService(LOCATION_SERVICE);
-            gpsListener = new LocationListener() {
-                @Override public void onLocationChanged(Location location) {
-                    dashboard.onLocation(location);
-                    if (dashboardPreview != null) dashboardPreview.invalidate();
-                }
-                @Override public void onStatusChanged(String provider, int status, Bundle extras) {}
-                @Override public void onProviderEnabled(String provider) {}
-                @Override public void onProviderDisabled(String provider) {}
-            };
-        }
         try {
-            locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER,
-                    300L, 0f, gpsListener, Looper.getMainLooper());
-        } catch (IllegalArgumentException | SecurityException e) {
-            append("GPS недоступен: " + e.getMessage());
+            Intent intent = new Intent(this, SpeedometerLocationService.class);
+            if (Build.VERSION.SDK_INT >= 26) startForegroundService(intent);
+            else startService(intent);
+        } catch (RuntimeException ex) {
+            append("Не удалось запустить фоновый GPS: " + ex.getMessage());
         }
     }
 
@@ -864,7 +860,7 @@ public final class MainActivity extends Activity {
                 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
             startGps();
         } else if (requestCode == LOCATION_REQUEST) {
-            append("Нет разрешения GPS — скорость будет показана как прочерк.");
+            append("GPS недоступен без разрешения точной геолокации.");
         }
     }
 
@@ -913,9 +909,6 @@ public final class MainActivity extends Activity {
     }
 
     @Override protected void onDestroy() {
-        if (locationManager != null && gpsListener != null) {
-            locationManager.removeUpdates(gpsListener);
-        }
         stopReading();
         unregisterReceiver(receiver);
         super.onDestroy();
