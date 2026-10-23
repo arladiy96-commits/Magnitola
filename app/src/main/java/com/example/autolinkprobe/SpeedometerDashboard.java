@@ -37,22 +37,66 @@ final class SpeedometerDashboard {
     private boolean speedValid;
     private float bearing = Float.NaN;
     private int accuracy = -1;
+    private String gpsStatus = "ПОИСК СПУТНИКОВ";
+    private int satellitesVisible = -1;
+    private int satellitesUsed = 0;
 
     SpeedometerDashboard() {
         background = Bitmap.createBitmap(W, H, Bitmap.Config.ARGB_8888);
         drawBackground(new Canvas(background));
     }
 
+    void setGpsStatus(String message) {
+        synchronized (gpsLock) { gpsStatus = message; }
+    }
+
+    void setSatellites(int visible, int used) {
+        synchronized (gpsLock) {
+            satellitesVisible = visible;
+            satellitesUsed = used;
+            gpsStatus = visible > 0 ? "СПУТНИКИ " + visible + " / " + used
+                    : "СПУТНИКОВ НЕ ВИДНО";
+        }
+    }
+
+    void clearSatellites() {
+        synchronized (gpsLock) {
+            satellitesVisible = -1;
+            satellitesUsed = 0;
+        }
+    }
+
     void onLocation(Location fix) {
-        if (fix == null || !fix.hasAccuracy() || fix.getAccuracy() > 80f) return;
+        if (fix == null) return;
+        if (!fix.hasAccuracy() || fix.getAccuracy() > 80f) {
+            setGpsStatus(fix.hasAccuracy()
+                    ? "СЛАБЫЙ GPS ±" + Math.round(fix.getAccuracy()) + " м"
+                    : "GPS: НЕТ ТОЧНОСТИ");
+            return;
+        }
         long now = SystemClock.elapsedRealtime();
         synchronized (gpsLock) {
             if (lastFixMs > now) return;
             accuracy = Math.round(fix.getAccuracy());
             if (fix.hasAltitude() && Double.isFinite(fix.getAltitude())) altitude = fix.getAltitude();
             if (firstFixMs < 0) firstFixMs = now;
+            // Older Android 7 GPS chips sometimes omit Location.hasSpeed().
+            // Derive a conservative value from successive accurate GPS fixes.
+            double kmh = Double.NaN;
             if (fix.hasSpeed() && Float.isFinite(fix.getSpeed())) {
-                double kmh = Math.max(0, Math.min(240, fix.getSpeed() * 3.6));
+                kmh = fix.getSpeed() * 3.6;
+            } else if (previous != null && lastFixMs >= 0
+                    && fix.getAccuracy() <= 25f && previous.getAccuracy() <= 25f) {
+                long deltaMs = now - lastFixMs;
+                if (deltaMs >= 750 && deltaMs <= 10000) {
+                    float metres = previous.distanceTo(fix);
+                    float noiseMetres = Math.max(4f,
+                            (fix.getAccuracy() + previous.getAccuracy()) * 0.5f);
+                    kmh = metres <= noiseMetres ? 0
+                            : metres * 3600.0 / deltaMs;
+                }
+            }
+            if (Double.isFinite(kmh) && kmh >= 0 && kmh <= 240) {
                 double dt = lastFixMs < 0 ? 1000 : Math.max(100, now - lastFixMs);
                 double alpha = 1.0 - Math.exp(-dt / 550.0);
                 filteredKmh = !speedValid || lastFixMs < 0 || dt > 5000
@@ -95,6 +139,9 @@ final class SpeedometerDashboard {
         boolean valid;
         int acc;
         float course;
+        String gpsMessage;
+        int visible;
+        int used;
         synchronized (gpsLock) {
             speed = filteredKmh;
             km = tripKm;
@@ -105,6 +152,9 @@ final class SpeedometerDashboard {
             valid = speedValid;
             course = bearing;
             acc = accuracy;
+            gpsMessage = gpsStatus;
+            visible = satellitesVisible;
+            used = satellitesUsed;
         }
         boolean gpsFresh = last >= 0 && SystemClock.elapsedRealtime() - last < 5000;
         if (!gpsFresh) valid = false;
@@ -116,7 +166,9 @@ final class SpeedometerDashboard {
         write(canvas, p, new SimpleDateFormat("HH:mm", Locale.getDefault())
                 .format(new Date()), 56, 76, 49, WHITE, false, Paint.Align.LEFT);
         write(canvas, p, "GPS", 1065, 60, 21, WHITE, true, Paint.Align.LEFT);
-        write(canvas, p, gpsFresh ? "±" + acc + " м" : "ПОИСК СПУТНИКОВ",
+        write(canvas, p, gpsFresh
+                        ? "±" + acc + " м" + (visible >= 0 ? " · " + used + "/" + visible : "")
+                        : gpsMessage,
                 1065, 92, 19, gpsFresh ? CYAN : GOLD, false, Paint.Align.LEFT);
         write(canvas, p, "ПОЕЗДКА", 88, 263, 20, MUTED, false, Paint.Align.LEFT);
         write(canvas, p, String.format(Locale.getDefault(), "%.1f", km),
