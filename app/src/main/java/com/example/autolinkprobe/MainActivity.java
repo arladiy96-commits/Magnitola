@@ -211,6 +211,13 @@ public final class MainActivity extends Activity {
         connect.setTextSize(11);
         connect.setOnClickListener(v -> startVideoTest());
         controls.addView(connect);
+        Button gpsSettings = new Button(this);
+        gpsSettings.setText("GPS");
+        gpsSettings.setTextSize(11);
+        gpsSettings.setContentDescription("Настройки геолокации планшета");
+        gpsSettings.setOnClickListener(v -> startActivity(
+                new Intent(android.provider.Settings.ACTION_LOCATION_SOURCE_SETTINGS)));
+        controls.addView(gpsSettings);
         Button toggle = new Button(this);
         toggle.setText("⚙");
         toggle.setContentDescription("Открыть или закрыть USB-диагностику");
@@ -842,6 +849,7 @@ public final class MainActivity extends Activity {
     private void startGps() {
         if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION)
                 != PackageManager.PERMISSION_GRANTED) {
+            dashboard.setGpsStatus("НЕТ РАЗРЕШЕНИЯ");
             requestPermissions(new String[]{Manifest.permission.ACCESS_FINE_LOCATION}, LOCATION_REQUEST);
             return;
         }
@@ -850,6 +858,7 @@ public final class MainActivity extends Activity {
             if (Build.VERSION.SDK_INT >= 26) startForegroundService(intent);
             else startService(intent);
         } catch (RuntimeException ex) {
+            dashboard.setGpsStatus("ОШИБКА GPS-СЛУЖБЫ");
             append("Не удалось запустить фоновый GPS: " + ex.getMessage());
         }
     }
@@ -861,8 +870,16 @@ public final class MainActivity extends Activity {
                 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
             startGps();
         } else if (requestCode == LOCATION_REQUEST) {
+            dashboard.setGpsStatus("НЕТ РАЗРЕШЕНИЯ");
             append("GPS недоступен без разрешения точной геолокации.");
         }
+    }
+
+    @Override protected void onResume() {
+        super.onResume();
+        // Re-arm the native GPS service after returning from system settings,
+        // including on Android 7 tablets where the provider was disabled.
+        startGps();
     }
 
     private void exportLog() {
